@@ -1,6 +1,6 @@
 # CS2 Match Bot
 
-Discord bot for organizing **1v1**, **2v2 Wingman**, and **5v5** Counter-Strike 2 matches. The bot queues players on Discord, builds MatchZy match JSON, and loads it on a CS2 dedicated server over RCON.
+Discord bot for organizing **1v1**, **2v2 Wingman**, and **5v5** Counter-Strike 2 matches. The bot queues players on Discord, runs captain draft and Premier-style map veto, builds MatchZy match JSON, and loads it on a CS2 dedicated server over RCON.
 
 ## Architecture
 
@@ -17,15 +17,17 @@ flowchart LR
 ```
 
 1. Players link their Steam64 ID in Discord.
-2. The bot creates **Queue » 1v1 / 2v2 / 5v5** voice channels, **#queue-status**, and **#match-results**.
+2. The bot creates **Queue » 1v1 / 2v2 / 5v5** voice channels, **#queue-status**, **#match-results**, and **#elo-leaderboard**.
 3. Players join a queue voice channel and react **✅** on the `#queue-status` message when ready.
-4. When enough players are ready, the bot generates MatchZy match JSON and loads it on the server.
-5. Players connect to the CS2 server and use MatchZy in-game commands like `.ready`.
+4. When enough players are ready, the bot runs captain selection (2v2/5v5), Premier map veto, and side pick (CT/T).
+5. The bot generates MatchZy match JSON and loads it on the server.
+6. Players connect to the CS2 server and use MatchZy in-game commands like `.ready`.
 
 ## Prerequisites
 
 - Docker and Docker Compose (for running the bot)
 - A [Discord bot token](https://discord.com/developers/applications)
+- **Message Content Intent** enabled for the bot in the Discord Developer Portal (required for `q!` commands)
 - **Either:**
   - A [DatHost CS2 server](https://dathost.net/cs2-server-hosting) with MatchZy installed, **or**
   - A self-hosted CS2 server via Docker (see `docker compose --profile local-server`)
@@ -60,7 +62,7 @@ DISCORD_GUILD_ID=...
 docker compose up -d --build match-bot
 ```
 
-4. Run `/admin testserver` in Discord to verify the DatHost connection.
+4. Run `q!admin testserver` in Discord to verify the DatHost connection.
 
 ### Option B — Local Docker CS2 server
 
@@ -83,7 +85,7 @@ Set `CS2_HOST=cs2-server` in `.env` when using Docker Compose.
 | `CS2_SERVER_PROVIDER` | `local` (self-hosted) or `dathost` |
 | `DISCORD_TOKEN` | Discord bot token |
 | `DISCORD_GUILD_ID` | **Required** for auto channel setup and queue UI |
-| `DISCORD_ADMIN_ROLE_ID` | Discord role ID for bot admins (can use `/admin` commands without server admin) |
+| `DISCORD_ADMIN_ROLE_ID` | Discord role ID for bot admins (can use `q!admin` commands without server admin) |
 | `DATHOST_EMAIL` | DatHost account email (`CS2_SERVER_PROVIDER=dathost`) |
 | `DATHOST_PASSWORD` | DatHost account password |
 | `DATHOST_GAME_SERVER_ID` | Server ID from DatHost control panel URL |
@@ -99,84 +101,96 @@ Set `CS2_HOST=cs2-server` in `.env` when using Docker Compose.
 | `CS2_PW` | Server password shown to players (optional) |
 | `MATCHZY_ADMINS` | Comma-separated Steam64 IDs for in-game MatchZy admins |
 
-3. Start the bot (see Option A or B above).
+2. Start the bot (see Option A or B above).
+
+3. In the [Discord Developer Portal](https://discord.com/developers/applications), enable **Message Content Intent** under Bot → Privileged Gateway Intents.
 
 4. Invite the bot to your Discord server with these scopes/permissions:
 
-- Scopes: `bot`, `applications.commands`
-- Permissions: `Manage Channels`, `Move Members`, `Connect`, `View Channels`, `Send Messages`, `Embed Links`, `Use Slash Commands`
+- Scopes: `bot`
+- Permissions: `Manage Channels`, `Move Members`, `Connect`, `View Channels`, `Send Messages`, `Embed Links`, `Add Reactions`, `Read Message History`
 
-5. Start the bot, then run `/admin setup` (or let it auto-create channels on startup if `DISCORD_GUILD_ID` is set).
+5. Start the bot, then run `q!admin setup` (or let it auto-create channels on startup if `DISCORD_GUILD_ID` is set).
 
 6. In Discord:
 
 ```
-/profile link steam_id:76561198000000000
+q!steamlink 76561198000000000
 Join voice channel: Queue » 1v1 / 2v2 / 5v5
 Open #queue-status and react ✅ when ready
 ```
+
+You can also use the **Link Steam Account** / **Unlink Steam** buttons on `#queue-status`.
 
 ## Queue flow
 
 | Step | Action |
 |---|---|
-| 1 | Link Steam with `/profile link` |
+| 1 | Link Steam with `q!steamlink <steamID64>` or the **Link Steam Account** button |
 | 2 | Join a **Queue » …** voice channel — you are added to that queue automatically and `#queue-status` updates live |
 | 3 | Open **#queue-status** and review the live queue embed |
 | 4 | React **✅** on the `#queue-status` message when ready, or **❌** / remove ✅ to unready |
 | 5 | Once the queue is **full**, everyone must ready within a mode-sized window (1v1: 1 min, 2v2: 2 min, 5v5: 5 min at default settings) or the queue is cancelled |
 | 6 | For **2v2 / 5v5**, lobby players vote for **Team Alpha** and **Team Bravo** captains via **Vote Captains** |
-| 7 | Elected captains alternate **Pick Player** until both teams are full, then the match starts |
+| 7 | Elected captains alternate **Pick Player** until both teams are full |
+| 8 | **Premier map veto** — captains alternate **Ban Map** (Active Duty pool) until one map remains |
+| 9 | The non-banning captain **Pick Side** (CT or T); the match then deploys to the server |
 
-The `#queue-status` message is posted and kept up to date automatically when players join or leave queue voice channels. It shows every queued player with ✅ ready / ⏳ not ready status, **✅** and **❌** reactions for ready/unready, live captain vote/draft progress for 2v2/5v5, and **Vote Captains** / **Pick Player** buttons. Leave a queue voice channel to leave the queue. When a queue reaches full size, all players must ready before the mode-scaled timeout (`QUEUE_READY_TIMEOUT_SECONDS`, default 5 minutes for 5v5) or the queue is cancelled and players are moved out of the voice channel.
+The `#queue-status` message is posted and kept up to date automatically when players join or leave queue voice channels. It shows every queued player with ✅ ready / ⏳ not ready status, **✅** and **❌** reactions for ready/unready, captain vote/draft progress, Premier veto status, and interactive buttons (**Vote Captains**, **Pick Player**, **Ban Map**, **Pick Side**, **Link Steam Account**, **Unlink Steam**). Leave a queue voice channel to leave the queue.
 
-When a match starts, the bot creates temporary team voice channels (e.g. `Match abc12345 » Team Alpha`) and moves players into them. When the match ends (MatchZy webhook or `/admin endmatch`), players are moved back to the voice channel they were in before the match, and the team channels are deleted.
+When a match starts, the bot creates temporary **CT** and **T** voice channels (e.g. `Match 1 » Team Alpha (CT)`) based on the veto side pick and moves players into the correct side. Spectators can join either channel to listen. When the match ends (MatchZy webhook or `q!admin endmatch`), players are moved back to the voice channel they were in before the match, team channels are deleted, and the final result is posted to `#match-results`.
 
 ## Supported maps
 
-Voice queues always use `DEFAULT_MAP` from `.env` (default **Dust II** / `de_dust2`). Join a **Queue » …** voice channel to enter the queue for that mode. Supported map ids include all current CS2 maps (see `bot/maps.py`).
+Voice queues always use `DEFAULT_MAP` from `.env` (default **Dust II** / `de_dust2`). Join a **Queue » …** voice channel to enter the queue for that mode.
 
-| Pool | Maps |
+**Premier map veto** uses the **Active Duty** pool only:
+
+| Map | ID |
 |---|---|
-| **Active Duty** | Ancient, Anubis, Dust II, Inferno, Mirage, Nuke, Overpass |
-| **Reserve** | Train, Vertigo, Basalt, Edin, Thera, Mills, Stronghold, Warden, Alpine |
-| **Hostage** | Office, Italy |
-| **Wingman** | Sanctum, Poseidon |
-| **Arms Race** | Baggage, Shoots, Pool Day |
-| **Legacy** | Cache, Cobblestone, Tuscan |
+| Ancient | `de_ancient` |
+| Anubis | `de_anubis` |
+| Dust II | `de_dust2` |
+| Inferno | `de_inferno` |
+| Mirage | `de_mirage` |
+| Nuke | `de_nuke` |
+| Overpass | `de_overpass` |
 
-Map ids use the server format (e.g. `de_mirage`, `cs_office`, `ar_baggage`). The full list lives in `bot/maps.py`.
+The full list of supported map IDs (Reserve, Wingman, etc.) lives in `bot/maps.py`.
 
 ## ELO system
 
 Each player has a separate ELO rating for **1v1**, **2v2**, and **5v5**. Ratings start at `1000` by default and update automatically when MatchZy sends a `series_end` or `match_end` webhook with a winner.
 
-- View your ratings with `/profile show`
-- View top players with `/profile leaderboard mode:5v5`
-- Completed match results are posted in **#match-results** (scroll to view history)
+- View your ratings with `q!profile show`
+- View top players with `q!profile leaderboard 5v5` (or `1v1` / `2v2`)
+- Live top-10 boards are kept in **#elo-leaderboard** (resets every 3 months)
+- Completed match results are posted in **#match-results**
 - ELO changes are included in each result post
 
-ELO uses standard team-average expected score with a configurable K-factor (`ELO_K_FACTOR` in `.env`). Admin-cancelled matches (`/admin endmatch`) do not change ELO.
+ELO uses standard team-average expected score with a configurable K-factor (`ELO_K_FACTOR` in `.env`). Admin-cancelled matches (`q!admin endmatch`) do not change ELO.
 
 ## Discord commands
 
+All player and admin commands use the **`q!`** prefix (case-insensitive). Interactive buttons on `#queue-status` use Discord button interactions and do not require typing commands.
+
 | Command | Description |
 |---|---|
-| `/help` | Show commands and how to queue/play |
-| `/profile link` | Link your 17-digit Steam64 ID |
-| `/profile show` | Show linked Steam account and ELO ratings |
-| `/profile leaderboard` | Top 10 players by mode |
-| `/queue status` | Show queue sizes |
-| `/admin setup` | Create/recreate voice + status channels (admin role or Manage Channels) |
-| `/admin resetcaptains` | Clear captain votes/draft and restart selection (admin role required) |
-| `/admin setcaptain` | Assign a captain and restart vote/draft (admin role required) |
-| `/admin testserver` | Test connection to local RCON or DatHost server |
-| `/admin forcestart` | Force-start the MatchZy match (admin role required) |
-| `/admin endmatch` | End the active MatchZy match (admin role required) |
+| `q!help` | Show commands and how to queue/play |
+| `q!steamlink <steamID64>` | Link your 17-digit Steam64 ID |
+| `q!profile show` | Show linked Steam account and ELO ratings |
+| `q!profile leaderboard [1v1\|2v2\|5v5]` | Top 10 players by mode |
+| `q!queue status` | Show queue sizes |
+| `q!admin setup` | Create/recreate voice + status channels (admin role or Manage Channels) |
+| `q!admin resetcaptains <1v1\|2v2\|5v5>` | Restart captain draft and Premier veto |
+| `q!admin setcaptain <mode> <alpha\|bravo> @player` | Assign a captain and restart vote/draft |
+| `q!admin testserver` | Test connection to local RCON or DatHost server |
+| `q!admin forcestart` | Force-start the MatchZy match |
+| `q!admin endmatch` | End the active MatchZy match (no ELO change) |
 
-Set `DISCORD_ADMIN_ROLE_ID` in `.env` to grant `/admin` commands to a custom role. Server administrators always have access. If the role ID is not set, only server administrators can run those commands.
+Set `DISCORD_ADMIN_ROLE_ID` in `.env` to grant `q!admin` commands to a custom role. Server administrators always have access. If the role ID is not set, only server administrators can run those commands.
 
-**Captain selection (2v2 / 5v5):** When enough players are ready, a lobby opens for captain **voting** in `#queue-status`. Each lobby player votes for Team Alpha and Team Bravo captains using **Vote Captains**. After voting, captains alternate **Pick Player** until rosters are full. Only admins can override with `/admin setcaptain` or `/admin resetcaptains`; either command clears the current vote/draft and restarts the process. Removing your ready reaction, leaving the queue, or a lobby player leaving also resets the active lobby.
+**Captain selection (2v2 / 5v5):** When enough players are ready, a lobby opens for captain **voting** in `#queue-status`. Each lobby player votes for Team Alpha and Team Bravo captains using **Vote Captains**. After voting, captains alternate **Pick Player** until rosters are full, then **Premier map veto** begins. Only admins can override with `q!admin setcaptain` or `q!admin resetcaptains`. Removing your ready reaction, leaving the queue, or a lobby player leaving also resets the active lobby flow.
 
 ## MatchZy integration
 
@@ -185,7 +199,9 @@ The bot communicates with MatchZy using:
 - **Local server:** TCP RCON (`CS2_HOST`, `CS2_PORT`, `CS2_RCON_PASSWORD`)
 - **DatHost server:** [DatHost Console API](https://dathost.net/docs) (MatchZy commands sent to server console)
 - **HTTP JSON** at `GET /matches/{match_id}.json` for match configuration
-- **Webhooks** at `POST /matchzy/events` for match results and ELO
+- **Webhooks** at `POST /matchzy/events` for match results, live scores, and ELO
+
+Match JSON includes the veto-selected map, CT/T side assignment (`map_sides`), and `skip_veto: true` so MatchZy does not run its own veto.
 
 After the CS2 container creates its data directory, configure MatchZy inside `cs2-data/game/csgo/cfg/MatchZy/config.cfg`:
 
@@ -223,14 +239,15 @@ Run the CS2 server separately with Docker Compose, or point `CS2_HOST`/`CS2_PORT
 
 ## Troubleshooting
 
-- **RCON authentication failed**: Check `CS2_RCON_PASSWORD` (local) or run `/admin testserver` (DatHost).
+- **RCON authentication failed**: Check `CS2_RCON_PASSWORD` (local) or run `q!admin testserver` (DatHost).
 - **DatHost commands not working**: Ensure MatchZy is installed and `DATHOST_*` credentials are correct.
 - **Match JSON load fails on DatHost**: `BOT_PUBLIC_URL` must be a public **HTTPS** URL reachable from the internet.
 - **Match JSON 401**: Ensure `MATCHZY_API_KEY` matches the header sent by `matchzy_loadmatch_url`.
 - **Players kicked as NOT ALLOWED**: They must join with the exact Steam64 ID linked in Discord.
-- **Slash commands missing**: Set `DISCORD_GUILD_ID` for instant guild sync, or wait up to an hour for global sync.
-- **Voice queue not detected after restart**: Run `/admin setup` once, or restart the bot with `DISCORD_GUILD_ID` set so channels reload on startup.
-- **Ready reaction does nothing**: Join a queue voice channel first and link Steam with `/profile link`.
+- **`q!` commands not working**: Enable **Message Content Intent** in the Discord Developer Portal and restart the bot.
+- **Voice queue not detected after restart**: Run `q!admin setup` once, or restart the bot with `DISCORD_GUILD_ID` set so channels reload on startup.
+- **Ready reaction does nothing**: Join a queue voice channel first and link Steam with `q!steamlink` or the **Link Steam Account** button.
+- **Deploy import errors on server**: Sync the entire `bot/` folder before rebuilding — partial uploads cause missing-module crashes.
 
 ## Project layout
 
@@ -243,14 +260,23 @@ cs2-match-bot/
 │   ├── bot_app.py
 │   ├── guild_setup.py
 │   ├── queue_ui.py
+│   ├── steam_link_ui.py
+│   ├── captain_flow.py
+│   ├── premier_veto_flow.py
+│   ├── match_sides.py
+│   ├── match_voice.py
+│   ├── live_match.py
 │   ├── elo.py
 │   ├── elo_service.py
+│   ├── elo_leaderboard.py
+│   ├── elo_season.py
 │   ├── match_results.py
 │   ├── dathost_client.py
 │   ├── server_console.py
 │   ├── server_connect.py
 │   ├── matchmaker.py
 │   ├── matchzy.py
+│   ├── maps.py
 │   ├── rcon.py
 │   ├── http_server.py
 │   └── storage.py
