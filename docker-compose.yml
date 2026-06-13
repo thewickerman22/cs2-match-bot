@@ -1,0 +1,45 @@
+services:
+  cs2-server:
+    profiles: ["local-server"]
+    image: xbird/cs2-matchzy:latest
+    container_name: cs2-match-bot-server
+    restart: unless-stopped
+    environment:
+      SRCDS_TOKEN: ${SRCDS_TOKEN:-}
+      CS2_SERVERNAME: ${CS2_SERVERNAME:-CS2 Match Bot Server}
+      CS2_PW: ${CS2_PW:-}
+      CS2_RCONPW: ${CS2_RCON_PASSWORD:-changeme}
+      CS2_PORT: 27015
+      CS2_LAN: "0"
+      SERVER_HIBERNATE: "0"
+      MATCHZY_ADMINS: ${MATCHZY_ADMINS:-}
+    ports:
+      - "27015:27015/tcp"
+      - "27015:27015/udp"
+      - "27020:27020/udp"
+    volumes:
+      - ./cs2-data:/home/steam/cs2-dedicated/
+    networks:
+      - match-net
+
+  match-bot:
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    container_name: cs2-match-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - bot-data:/app/data
+    networks:
+      - match-net
+
+networks:
+  match-net:
+    driver: bridge
+
+volumes:
+  bot-data:
