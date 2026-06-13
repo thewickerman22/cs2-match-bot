@@ -142,9 +142,9 @@ When a match starts, the bot creates temporary **CT** and **T** voice channels (
 
 ## Supported maps
 
-Voice queues always use `DEFAULT_MAP` from `.env` (default **Dust II** / `de_dust2`). Join a **Queue » …** voice channel to enter the queue for that mode.
+Voice queues always use `DEFAULT_MAP` from `.env` (default **Dust II** / `de_dust2`). Join a **Queue » …** voice channel to enter the queue for that mode. Map ids use the server format (e.g. `de_mirage`, `cs_office`, `ar_baggage`).
 
-**Premier map veto** uses the **Active Duty** pool only:
+**Premier map veto** uses the **Active Duty** pool only (7 maps). Matches deploy the veto-selected map — your server must have that map installed.
 
 | Map | ID |
 |---|---|
@@ -156,7 +156,21 @@ Voice queues always use `DEFAULT_MAP` from `.env` (default **Dust II** / `de_dus
 | Nuke | `de_nuke` |
 | Overpass | `de_overpass` |
 
-The full list of supported map IDs (Reserve, Wingman, etc.) lives in `bot/maps.py`.
+The bot also recognizes these map ids (for validation and display). Not all are in current Valve matchmaking rotation; some were removed from CS2 but may still work on custom servers.
+
+| Pool | Maps |
+|---|---|
+| **Reserve** | Train (`de_train`), Vertigo, Stronghold, Warden, Golden, Palacio, Cache, Cobblestone (`de_cbble`), Grail, Jura, Basalt, Edin |
+| **Hostage** | Agency (`cs_agency`), Alpine (`cs_alpine`), Italy, Office |
+| **Wingman** | Sanctum, Poseidon, Rooftop, Assembly, Brewery, Dogtown, Memento, Palais, Whistle, Transit |
+| **Arms Race** | Baggage, Shoots, Shoots (Night), Pool Day |
+| **Variant** | Ancient (Night) (`de_ancient_night`) |
+| **Discontinued** | Mills, Thera |
+| **Legacy** | Canals, Lake, Dust, Sugarcane, Tuscan |
+
+**Aliases:** `de_alpine` → `cs_alpine`, `de_cobblestone` → `de_cbble`.
+
+The canonical list lives in `bot/maps.py` (`CS2_MAPS`, `PREMIER_VETO_POOL`, `MAP_ALIASES`).
 
 ## ELO system
 
