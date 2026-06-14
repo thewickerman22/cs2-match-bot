@@ -17,10 +17,12 @@ from match_voice import (
     create_match_voice_channels,
     delete_match_voice_channels,
     enforce_player_team_voice,
+    find_match_voice_channels_by_name,
+    move_match_players_to_end_queue,
     move_players_to_team_channels,
-    restore_players_to_original_channels,
 )
-from live_match import LIVE_UPDATE_EVENTS, LiveMatchSnapshot, build_live_match_embed
+from matchzy_events import FINISH_EVENTS, LIVE_UPDATE_EVENTS, extract_match_id, normalize_event_name
+from live_match import LiveMatchSnapshot, build_live_match_embed
 from match_results import build_match_result_embed
 from matchmaker import Matchmaker
 from matchzy import ActiveMatch, MatchZyService, serialize_match_config
@@ -104,6 +106,8 @@ class MatchBot(commands.Bot):
         self._reaction_sync_user_ids: set[int] = set()
         self._queue_ready_timer_tasks: dict[tuple[MatchMode, str], asyncio.Task] = {}
         self._match_status_messages: dict[str, int] = {}
+        self._match_voice_channels: dict[str, tuple[int, int]] = {}
+        self._match_finish_fallback_tasks: dict[str, asyncio.Task] = {}
         self._live_match_snapshots: dict[str, LiveMatchSnapshot] = {}
 
     async def _purge_discord_commands(self, guild_id: int | None) -> None:
@@ -493,18 +497,10 @@ class MatchBot(commands.Bot):
             task.cancel()
 
     def _queue_ready_timeout_seconds(self, mode: MatchMode, queue_size: int) -> int:
-        """Scale the ready-up window by how full the queue is for this mode."""
-        if queue_size <= 0:
+        """Ready-up window once the queue is full (same duration for 1v1, 2v2, and 5v5)."""
+        if queue_size < mode.total_players:
             return 0
-
-        full_size = mode.total_players
-        if queue_size < full_size:
-            return 0
-
-        reference_players = MatchMode.FIVE_V_FIVE.total_players
-        full_timeout = self.settings.queue_ready_timeout_seconds
-        mode_timeout = int(full_timeout * mode.total_players / reference_players)
-        return max(60, mode_timeout)
+        return max(60, self.settings.queue_ready_timeout_seconds)
 
     async def _update_queue_ready_timers(self, guild: discord.Guild) -> None:
         default_map = self.settings.default_map
@@ -900,27 +896,44 @@ class MatchBot(commands.Bot):
             if isinstance(channel, discord.TextChannel):
                 await channel.send(f"{member.mention} {message}")
 
-    async def _get_active_match_voice(
+    async def _get_match_voice_ids(self, match_id: str) -> tuple[int, int] | None:
+        cached = self._match_voice_channels.get(match_id)
+        if cached is not None:
+            return cached
+        stored = await self.storage.get_match_voice_channels(match_id)
+        if stored is not None:
+            self._match_voice_channels[match_id] = stored
+        return stored
+
+    async def _find_match_for_voice_channel(
         self,
-        discord_id: int,
+        channel_id: int,
     ) -> tuple[ActiveMatch, int, int] | None:
         for match in self.matchmaker.active_matches.values():
-            roster_ids = {player.discord_id for player in match.team1 + match.team2}
-            if discord_id not in roster_ids:
-                continue
-            voice_ids = await self.storage.get_match_voice_channels(match.match_id)
+            voice_ids = await self._get_match_voice_ids(match.match_id)
             if voice_ids is None:
                 continue
             team1_id, team2_id = voice_ids
-            return match, team1_id, team2_id
+            if channel_id in {team1_id, team2_id}:
+                return match, team1_id, team2_id
         return None
 
     async def _enforce_match_team_voice(self, member: discord.Member) -> None:
-        active = await self._get_active_match_voice(member.id)
+        if member.voice is None or member.voice.channel is None:
+            return
+
+        active = await self._find_match_for_voice_channel(member.voice.channel.id)
         if active is None:
             return
+
         match, team1_id, team2_id = active
-        await enforce_player_team_voice(member.guild, member, match, team1_id, team2_id)
+        await enforce_player_team_voice(
+            member.guild,
+            member,
+            match,
+            team1_id,
+            team2_id,
+        )
 
     def _build_match_embed(
         self,
@@ -936,7 +949,7 @@ class MatchBot(commands.Bot):
             title=f"{match.mode.label} match ready",
             description=(
                 "You have been moved to your **team voice channel**. "
-                "Spectators may join either team channel to listen. "
+                "Only players in this match can join CT/T voice. "
                 "Connect to the CS2 server — MatchZy assigns your in-game team from your linked Steam ID.\n"
                 "Type `.ready` in game chat when connected.\n"
                 f"Match ID: `{match.match_id}`"
@@ -1020,19 +1033,26 @@ class MatchBot(commands.Bot):
             logger.exception("Failed to create team voice channels for match %s", match.match_id)
             return None
 
-        await self.storage.save_match_voice_channels(
+        self._match_voice_channels[match.match_id] = (
+            voice_channels.team1_channel_id,
+            voice_channels.team2_channel_id,
+        )
+        saved = await self.storage.save_match_voice_channels(
             match.match_id,
             voice_channels.team1_channel_id,
             voice_channels.team2_channel_id,
         )
-        original_channels = await move_players_to_team_channels(
+        if not saved:
+            logger.error(
+                "Failed to persist team voice channel ids for match %s",
+                match.match_id,
+            )
+        await move_players_to_team_channels(
             guild,
             match,
             voice_channels.team1_channel_id,
             voice_channels.team2_channel_id,
         )
-        if original_channels:
-            await self.storage.save_match_voice_returns(match.match_id, original_channels)
         return voice_channels.team1_channel_id, voice_channels.team2_channel_id
 
     async def _active_match_ids(self) -> list[str]:
@@ -1047,8 +1067,11 @@ class MatchBot(commands.Bot):
         *,
         allow_single_active_fallback: bool = False,
     ) -> str | None:
-        if raw_match_id != "unknown":
-            resolved = await self.elo_service.resolve_match_id(raw_match_id)
+        normalized = str(raw_match_id).strip()
+        if normalized and normalized != "unknown":
+            if normalized in self.matchmaker.active_matches:
+                return normalized
+            resolved = await self.elo_service.resolve_match_id(normalized)
             if resolved is not None:
                 return resolved
 
@@ -1056,9 +1079,191 @@ class MatchBot(commands.Bot):
             return None
 
         active_ids = await self._active_match_ids()
+        if not active_ids:
+            return None
         if len(active_ids) == 1:
             return active_ids[0]
+
+        if normalized.isdigit():
+            for match_id in active_ids:
+                if match_id == normalized:
+                    return match_id
         return None
+
+    async def _ensure_guild_for_events(self) -> discord.Guild | None:
+        if self.settings.discord_guild_id is None:
+            logger.warning("DISCORD_GUILD_ID is not set; ignoring MatchZy event")
+            return None
+
+        guild = self.get_guild(self.settings.discord_guild_id)
+        if guild is None:
+            try:
+                guild = await self.fetch_guild(self.settings.discord_guild_id)
+            except discord.HTTPException:
+                logger.exception(
+                    "Could not fetch guild %s for MatchZy event",
+                    self.settings.discord_guild_id,
+                )
+                return None
+
+        if guild.id not in self.guild_setups:
+            setup = await self.storage.get_guild_setup(guild.id)
+            if setup is not None:
+                self.guild_setups[guild.id] = setup
+
+        return guild
+
+    async def _get_match_display_data(
+        self,
+        match_id: str,
+    ) -> tuple[MatchMode, str, list[int], list[int], dict[int, str], dict[int, str]] | None:
+        roster = await self.elo_service.get_roster(match_id)
+        if roster is not None:
+            record = await self.storage.get_match_record(match_id)
+            map_name = record["map_name"] if record is not None else ""
+            return (
+                roster.mode,
+                map_name,
+                roster.team1_ids,
+                roster.team2_ids,
+                roster.team1_names,
+                roster.team2_names,
+            )
+
+        active_match = self.matchmaker.get_match(match_id)
+        record = await self.storage.get_match_record(match_id)
+        if active_match is None and record is None:
+            return None
+
+        if active_match is not None:
+            mode = active_match.mode
+            map_name = active_match.map_name
+            team1_ids = [player.discord_id for player in active_match.team1]
+            team2_ids = [player.discord_id for player in active_match.team2]
+            team1_names = {player.discord_id: player.discord_name for player in active_match.team1}
+            team2_names = {player.discord_id: player.discord_name for player in active_match.team2}
+        else:
+            mode = MatchMode(record["mode"])
+            map_name = record["map_name"]
+            stored_roster = record.get("roster") or {}
+            team1_ids = stored_roster.get("team1_ids", [])
+            team2_ids = stored_roster.get("team2_ids", [])
+            team1_names = stored_roster.get("team1_names", {})
+            team2_names = stored_roster.get("team2_names", {})
+
+        if not map_name and record is not None:
+            map_name = record["map_name"]
+
+        return mode, map_name, team1_ids, team2_ids, team1_names, team2_names
+
+    def _cancel_match_finish_fallback(self, match_id: str) -> None:
+        task = self._match_finish_fallback_tasks.pop(match_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _schedule_match_finish_fallback(
+        self,
+        guild: discord.Guild,
+        match_id: str,
+        payload: dict,
+        *,
+        delay_seconds: int = 20,
+    ) -> None:
+        self._cancel_match_finish_fallback(match_id)
+
+        async def _fallback() -> None:
+            try:
+                await asyncio.sleep(delay_seconds)
+            except asyncio.CancelledError:
+                return
+
+            record = await self.storage.get_match_record(match_id)
+            if record is not None and record.get("status") == "completed":
+                return
+
+            logger.warning(
+                "No series_end received for match %s; finishing from map_result fallback",
+                match_id,
+            )
+            await self._finish_match_from_event(guild, match_id, payload)
+
+        self._match_finish_fallback_tasks[match_id] = asyncio.create_task(
+            _fallback(),
+            name=f"match-finish-fallback-{match_id}",
+        )
+
+    async def _resolve_match_voice_ids(
+        self,
+        guild: discord.Guild,
+        match_id: str,
+    ) -> tuple[int, int] | None:
+        cached = self._match_voice_channels.get(match_id)
+        if cached is not None:
+            return cached
+
+        stored = await self.storage.get_match_voice_channels(match_id)
+        if stored is not None:
+            self._match_voice_channels[match_id] = stored
+            return stored
+
+        discovered = await find_match_voice_channels_by_name(guild, match_id)
+        if discovered is not None:
+            logger.info(
+                "Discovered team voice channels for match %s by name: %s, %s",
+                match_id,
+                discovered[0],
+                discovered[1],
+            )
+            self._match_voice_channels[match_id] = discovered
+            await self.storage.save_match_voice_channels(
+                match_id,
+                discovered[0],
+                discovered[1],
+            )
+        return discovered
+
+    async def _get_match_roster_ids(self, match_id: str) -> set[int]:
+        active_match = self.matchmaker.get_match(match_id)
+        if active_match is not None:
+            return {player.discord_id for player in active_match.team1 + active_match.team2}
+
+        roster = await self.elo_service.get_roster(match_id)
+        if roster is None:
+            return set()
+        return set(roster.team1_ids + roster.team2_ids)
+
+    async def _ensure_end_queue_channel(
+        self,
+        guild: discord.Guild,
+    ) -> int | None:
+        setup = await self._get_guild_setup(guild)
+        if setup is None:
+            setup = await self.ensure_guild_channels(guild)
+        else:
+            end_queue = guild.get_channel(setup.end_queue_channel_id)
+            if not isinstance(end_queue, discord.VoiceChannel):
+                setup = await ensure_guild_setup(guild, setup)
+                await self.storage.save_guild_setup(setup)
+                self.guild_setups[guild.id] = setup
+
+        if setup.end_queue_channel_id:
+            return setup.end_queue_channel_id
+
+        setup = await ensure_guild_setup(guild, setup)
+        await self.storage.save_guild_setup(setup)
+        self.guild_setups[guild.id] = setup
+        return setup.end_queue_channel_id or None
+
+    async def _delete_match_voice_channels(
+        self,
+        guild: discord.Guild,
+        match_id: str,
+        team1_id: int,
+        team2_id: int,
+    ) -> None:
+        await delete_match_voice_channels(guild, team1_id, team2_id)
+        self._match_voice_channels.pop(match_id, None)
+        await self.storage.clear_match_voice_channels(match_id)
 
     async def cleanup_match(
         self,
@@ -1070,41 +1275,44 @@ class MatchBot(commands.Bot):
         record = await self.storage.get_match_record(match_id)
         already_completed = record is not None and record.get("status") == "completed"
 
-        voice_ids = await self.storage.get_match_voice_channels(match_id)
-        original_channels = await self.storage.get_match_voice_returns(match_id)
+        voice_ids = await self._resolve_match_voice_ids(guild, match_id)
 
         if voice_ids is not None:
             team1_id, team2_id = voice_ids
-            if original_channels:
-                await restore_players_to_original_channels(
-                    guild,
-                    original_channels,
-                    team1_id,
-                    team2_id,
-                )
-            await delete_match_voice_channels(guild, team1_id, team2_id)
+            roster_ids = await self._get_match_roster_ids(match_id)
+            if roster_ids:
+                end_queue_id = await self._ensure_end_queue_channel(guild)
+                if end_queue_id is not None:
+                    await move_match_players_to_end_queue(
+                        guild,
+                        roster_ids,
+                        team1_id,
+                        team2_id,
+                        end_queue_id,
+                    )
+            await self._delete_match_voice_channels(guild, match_id, team1_id, team2_id)
             logger.info(
-                "Deleted team voice channels for match %s (%s, %s)",
+                "Cleaned up team voice channels for match %s (%s, %s)",
                 match_id,
                 team1_id,
                 team2_id,
             )
-        elif already_completed:
-            self.matchmaker.finish_match(match_id)
-            return
-        else:
+        elif not already_completed:
             logger.warning(
                 "No team voice channels stored for match %s during cleanup",
                 match_id,
             )
 
+        if already_completed:
+            self.matchmaker.finish_match(match_id)
+            return
+
         await self.storage.clear_match_voice_returns(match_id)
+
+        self._cancel_match_finish_fallback(match_id)
 
         await self.storage.update_match_status(match_id, "completed")
         self.matchmaker.finish_match(match_id)
-
-        if already_completed:
-            return
 
         if cancelled:
             await self._finalize_cancelled_live_match(guild, match_id)
@@ -1115,12 +1323,18 @@ class MatchBot(commands.Bot):
         if setup is not None:
             channel = guild.get_channel(setup.status_channel_id)
             if isinstance(channel, discord.TextChannel):
-                end_note = (
-                    "cancelled by an admin"
-                    if cancelled
-                    else "ended. Players returned to their previous voice channels"
+                end_queue = guild.get_channel(setup.end_queue_channel_id)
+                end_queue_mention = (
+                    f" Players moved to {end_queue.mention}."
+                    if isinstance(end_queue, discord.VoiceChannel)
+                    else " Players moved to **End Queue**."
                 )
-                await channel.send(f"Match `{match_id}` {end_note}.")
+                end_note = (
+                    f"cancelled by an admin.{end_queue_mention}"
+                    if cancelled
+                    else f"ended.{end_queue_mention}"
+                )
+                await channel.send(f"Match `{match_id}` {end_note}")
 
         await self.refresh_queue_status(guild)
 
@@ -1193,36 +1407,43 @@ class MatchBot(commands.Bot):
         snapshot = self._live_match_snapshots.setdefault(match_id, LiveMatchSnapshot())
         snapshot.merge_event(event_name, payload)
 
+        display = await self._get_match_display_data(match_id)
+        if display is None:
+            logger.warning("No roster/record for live update on match %s", match_id)
+            return
+
+        mode, map_name, team1_ids, team2_ids, team1_names, team2_names = display
         results_channel = await self._get_results_channel(guild)
         if results_channel is None:
-            return
-
-        message_id = await self.storage.get_live_results_message_id(match_id)
-        if message_id is None:
-            return
-
-        record = await self.storage.get_match_record(match_id)
-        roster = await self.elo_service.get_roster(match_id)
-        if record is None or roster is None:
+            logger.warning("No #match-results channel configured for live update")
             return
 
         embed = build_live_match_embed(
             match_id,
-            MatchMode(record["mode"]),
-            record["map_name"],
-            roster.team1_ids,
-            roster.team2_ids,
-            roster.team1_names,
-            roster.team2_names,
+            mode,
+            map_name,
+            team1_ids,
+            team2_ids,
+            team1_names,
+            team2_names,
             snapshot,
             server_connect_field=self._server_connect_field(),
         )
+
+        message_id = await self.storage.get_live_results_message_id(match_id)
+        if message_id is None:
+            message = await results_channel.send(embed=embed)
+            await self.storage.save_live_results_message_id(match_id, message.id)
+            logger.info("Created live match message for %s during %s", match_id, event_name)
+            return
 
         try:
             message = await results_channel.fetch_message(message_id)
             await message.edit(embed=embed)
         except discord.NotFound:
-            logger.warning("Live match message %s not found for match %s", message_id, match_id)
+            message = await results_channel.send(embed=embed)
+            await self.storage.save_live_results_message_id(match_id, message.id)
+            logger.warning("Recreated missing live match message for %s", match_id)
         except discord.HTTPException:
             logger.exception("Failed to update live match embed for %s", match_id)
 
@@ -1266,21 +1487,23 @@ class MatchBot(commands.Bot):
     ) -> None:
         results_channel = await self._get_results_channel(guild)
         if results_channel is None:
+            logger.warning("No #match-results channel configured for match %s", match_id)
             return
 
-        record = await self.storage.get_match_record(match_id)
-        roster = await self.elo_service.get_roster(match_id)
-        if record is None or roster is None:
+        display = await self._get_match_display_data(match_id)
+        if display is None:
+            logger.warning("No roster/record for final result on match %s", match_id)
             return
 
+        mode, map_name, team1_ids, team2_ids, team1_names, team2_names = display
         embed = build_match_result_embed(
             match_id=match_id,
-            mode=roster.mode,
-            map_name=record["map_name"],
-            team1_ids=roster.team1_ids,
-            team2_ids=roster.team2_ids,
-            team1_names=roster.team1_names,
-            team2_names=roster.team2_names,
+            mode=mode,
+            map_name=map_name,
+            team1_ids=team1_ids,
+            team2_ids=team2_ids,
+            team1_names=team1_names,
+            team2_names=team2_names,
             payload=payload,
             elo_changes=elo_changes,
         )
@@ -1302,8 +1525,6 @@ class MatchBot(commands.Bot):
             logger.info("Posted final match result for %s", match_id)
 
         await self.storage.clear_live_results_message_id(match_id)
-        if elo_changes:
-            await self.refresh_elo_leaderboard(guild)
 
     async def _ensure_dathost_server_ready(self) -> None:
         if self.settings.server_provider != ServerProvider.DATHOST:
@@ -1336,6 +1557,15 @@ class MatchBot(commands.Bot):
         await self.storage.set_next_match_id(self.matchmaker.next_match_id)
         await self.elo_service.save_roster_from_match(match)
 
+        team_voice_ids = await self._setup_match_voice_channels(guild, match)
+        if team_voice_ids is None:
+            await self._rollback_failed_match(
+                guild,
+                match,
+                RuntimeError("Could not create team voice channels"),
+            )
+            return
+
         try:
             await self._ensure_dathost_server_ready()
             responses = await self.matchzy.deploy_match(match)
@@ -1345,9 +1575,7 @@ class MatchBot(commands.Bot):
             await self._rollback_failed_match(guild, match, exc)
             return
 
-        team_voice_ids = await self._setup_match_voice_channels(guild, match)
-        team1_voice_id = team_voice_ids[0] if team_voice_ids else None
-        team2_voice_id = team_voice_ids[1] if team_voice_ids else None
+        team1_voice_id, team2_voice_id = team_voice_ids
 
         embed = self._build_match_embed(match, team1_voice_id, team2_voice_id)
         setup = self.guild_setups.get(guild.id)
@@ -1394,6 +1622,15 @@ class MatchBot(commands.Bot):
         match: ActiveMatch,
         error: Exception,
     ) -> None:
+        voice_ids = await self._resolve_match_voice_ids(guild, match.match_id)
+        if voice_ids is not None:
+            await self._delete_match_voice_channels(
+                guild,
+                match.match_id,
+                voice_ids[0],
+                voice_ids[1],
+            )
+
         self.matchmaker.restore_match_players_to_queue(match)
         await self.storage.update_match_status(match.match_id, "cancelled")
 
@@ -1954,7 +2191,8 @@ class MatchBot(commands.Bot):
                 "When a lobby is full, captains run **Premier map veto**: alternate **Ban Map** "
                 "(Active Duty pool), then **Pick Side** (CT/T).\n"
                 "For **2v2 / 5v5**, use **Vote Captains** and **Pick Player** first, then map veto.\n"
-                "During matches, voice channels are **CT** and **T** based on the veto result.\n\n"
+                "During matches, voice channels are **CT** and **T** based on the veto result.\n"
+                "When a match ends, players are moved to **End Queue**.\n\n"
                 f"**#{ELO_CHANNEL_NAME}** shows the live ELO leaderboard (top 10 per mode). "
                 "Ratings reset every **3 months**. Wins add ELO, losses subtract ELO."
             ),
@@ -1975,7 +2213,7 @@ class MatchBot(commands.Bot):
         embed.add_field(
             name="Admin commands",
             value=(
-                f"`{COMMAND_PREFIX}admin setup` — create queue voice + status channels "
+                f"`{COMMAND_PREFIX}admin setup` — create queue voice, End Queue, and status channels "
                 "(admin role or **Manage Channels**)\n"
                 f"All other `{COMMAND_PREFIX}admin` commands require the configured admin role "
                 "or **Server Administrator**.\n"
@@ -2103,7 +2341,8 @@ class MatchBot(commands.Bot):
             f"- <#{setup.elo_channel_id}> (live ELO leaderboard)\n"
             f"- <#{setup.voice_channels[MatchMode.ONE_V_ONE]}> (1v1)\n"
             f"- <#{setup.voice_channels[MatchMode.TWO_V_TWO]}> (2v2)\n"
-            f"- <#{setup.voice_channels[MatchMode.FIVE_V_FIVE]}> (5v5)"
+            f"- <#{setup.voice_channels[MatchMode.FIVE_V_FIVE]}> (5v5)\n"
+            f"- <#{setup.end_queue_channel_id}> (End Queue — post-match lobby)"
         )
 
     @admin_group.command(name="testserver")
@@ -2304,32 +2543,29 @@ class MatchBot(commands.Bot):
         match_id: str,
         payload: dict,
     ) -> None:
-        record = await self.storage.get_match_record(match_id)
-        if record is not None and record.get("status") == "completed":
-            logger.info("Match %s already completed; skipping duplicate end event", match_id)
-            return
+        self._cancel_match_finish_fallback(match_id)
 
-        elo_changes = await self.elo_service.process_match_result(match_id, payload)
-        await self._post_match_result(guild, match_id, payload, elo_changes)
+        record = await self.storage.get_match_record(match_id)
+        already_completed = record is not None and record.get("status") == "completed"
+
+        if not already_completed:
+            elo_changes = await self.elo_service.process_match_result(match_id, payload)
+            await self._post_match_result(guild, match_id, payload, elo_changes)
+            if elo_changes:
+                await self.refresh_elo_leaderboard(guild)
+                logger.info("Refreshed #elo-leaderboard after match %s", match_id)
+        else:
+            logger.info("Match %s already completed; skipping duplicate result post", match_id)
+
         await self.cleanup_match(guild, match_id)
 
     async def handle_match_event(self, event_name: str, payload: dict) -> None:
-        match_id = str(payload.get("matchid", payload.get("match_id", "unknown")))
+        event_name = normalize_event_name(str(payload.get("event", event_name)))
+        match_id = extract_match_id(payload)
         logger.info("Match event %s for match %s", event_name, match_id)
 
-        end_events = {"series_end", "map_result", "match_end"}
-        is_end_event = event_name in end_events
-
-        if self.settings.discord_guild_id is None:
-            return
-
-        guild = self.get_guild(self.settings.discord_guild_id)
+        guild = await self._ensure_guild_for_events()
         if guild is None:
-            logger.warning("Guild %s not in cache for match event %s", self.settings.discord_guild_id, event_name)
-            return
-
-        setup = self.guild_setups.get(guild.id) or await self.storage.get_guild_setup(guild.id)
-        if setup is None:
             return
 
         resolved_match_id = await self._resolve_match_id_for_event(
@@ -2340,7 +2576,11 @@ class MatchBot(commands.Bot):
         if resolved_match_id is not None and event_name in LIVE_UPDATE_EVENTS:
             await self._update_live_match_embed(guild, resolved_match_id, event_name, payload)
 
-        if not is_end_event:
+        if event_name == "map_result" and resolved_match_id is not None:
+            self._schedule_match_finish_fallback(guild, resolved_match_id, payload)
+            return
+
+        if event_name not in FINISH_EVENTS:
             return
 
         if resolved_match_id is None:
@@ -2354,11 +2594,9 @@ class MatchBot(commands.Bot):
             return
 
         active_ids = await self._active_match_ids()
-        logger.warning(
-            "Could not resolve webhook match id %r for end event %s; active matches: %s",
-            match_id,
+        logger.error(
+            "Ignoring finish event %s with unresolved match id %r; active matches: %s",
             event_name,
+            match_id,
             active_ids,
         )
-        for active_id in active_ids:
-            await self._finish_match_from_event(guild, active_id, payload)

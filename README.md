@@ -94,7 +94,7 @@ Set `CS2_HOST=cs2-server` in `.env` when using Docker Compose.
 | `CS2_RCON_PASSWORD` | RCON password (local Docker server only) |
 | `MATCHZY_API_KEY` | Shared secret for match JSON + webhook endpoints |
 | `DEFAULT_MAP` | Default map for voice queues (default `de_dust2`) |
-| `QUEUE_READY_TIMEOUT_SECONDS` | Ready-up window for a **full 5v5** queue (default `300`). Scales by mode: 1v1 = 1 min, 2v2 = 2 min, 5v5 = 5 min |
+| `QUEUE_READY_TIMEOUT_SECONDS` | Ready-up window once a queue is **full** (default `300` = 5 minutes for 1v1, 2v2, and 5v5) |
 | `ELO_DEFAULT` | Starting ELO for new players (default `1000`) |
 | `ELO_K_FACTOR` | ELO K-factor per match (default `32`) |
 | `CS2_PUBLIC_HOST` | Public IP or hostname players use in `connect` (optional) |
@@ -130,7 +130,7 @@ You can also use the **Link Steam Account** / **Unlink Steam** buttons on `#queu
 | 2 | Join a **Queue » …** voice channel — you are added to that queue automatically and `#queue-status` updates live |
 | 3 | Open **#queue-status** and review the live queue embed |
 | 4 | React **✅** on the `#queue-status` message when ready, or **❌** / remove ✅ to unready |
-| 5 | Once the queue is **full**, everyone must ready within a mode-sized window (1v1: 1 min, 2v2: 2 min, 5v5: 5 min at default settings) or the queue is cancelled |
+| 5 | Once the queue is **full**, everyone must ready within **5 minutes** (default) or the queue is cancelled |
 | 6 | For **2v2 / 5v5**, lobby players vote for **Team Alpha** and **Team Bravo** captains via **Vote Captains** |
 | 7 | Elected captains alternate **Pick Player** until both teams are full |
 | 8 | **Premier map veto** — captains alternate **Ban Map** (Active Duty pool) until one map remains |
@@ -138,7 +138,7 @@ You can also use the **Link Steam Account** / **Unlink Steam** buttons on `#queu
 
 The `#queue-status` message is posted and kept up to date automatically when players join or leave queue voice channels. It shows every queued player with ✅ ready / ⏳ not ready status, **✅** and **❌** reactions for ready/unready, captain vote/draft progress, Premier veto status, and interactive buttons (**Vote Captains**, **Pick Player**, **Ban Map**, **Pick Side**, **Link Steam Account**, **Unlink Steam**). Leave a queue voice channel to leave the queue.
 
-When a match starts, the bot creates temporary **CT** and **T** voice channels (e.g. `Match 1 » Team Alpha (CT)`) based on the veto side pick and moves players into the correct side. Spectators can join either channel to listen. When the match ends (MatchZy webhook or `q!admin endmatch`), players are moved back to the voice channel they were in before the match, team channels are deleted, and the final result is posted to `#match-results`.
+When a match starts, the bot creates temporary **CT** and **T** voice channels (e.g. `Match 1 » Team Alpha (CT)`) based on the veto side pick and moves players into the correct side. Only players in that match can join their assigned channel. When the match ends (MatchZy webhook or `q!admin endmatch`), players are moved back to the voice channel they were in before the match, team channels are deleted, and the final result is posted to `#match-results`.
 
 ## Supported maps
 

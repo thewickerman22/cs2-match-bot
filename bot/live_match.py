@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import discord
 
@@ -49,13 +49,8 @@ class LiveMatchSnapshot:
             self.status = "Live"
         elif event_name == "round_end":
             self.status = "Live"
-        elif event_name in {"map_result", "series_end", "match_end"}:
+        elif event_name in {"map_result", "series_end", "series_result", "match_end"}:
             self.status = "Finished"
-
-
-LIVE_UPDATE_EVENTS = frozenset(
-    {"series_start", "going_live", "round_end", "map_result", "series_end", "match_end"}
-)
 
 
 def _format_team_lines(

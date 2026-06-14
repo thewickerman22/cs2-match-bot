@@ -21,6 +21,8 @@ def parse_winner_team(payload: dict) -> str | None:
         team = winner.get("team")
         if team in {"team1", "team2"}:
             return team
+        if team in {"none", "draw", ""}:
+            return None
 
     team1_score = payload.get("team1_series_score")
     team2_score = payload.get("team2_series_score")

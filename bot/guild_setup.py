@@ -15,6 +15,7 @@ VOICE_CHANNEL_NAMES = {
     MatchMode.TWO_V_TWO: "Queue » 2v2",
     MatchMode.FIVE_V_FIVE: "Queue » 5v5",
 }
+END_QUEUE_CHANNEL_NAME = "End Queue"
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,7 @@ class GuildSetup:
     elo_channel_id: int
     elo_message_id: int | None
     voice_channels: dict[MatchMode, int]
+    end_queue_channel_id: int = 0
 
     def mode_for_voice_channel(self, channel_id: int) -> MatchMode | None:
         for mode, voice_id in self.voice_channels.items():
@@ -132,6 +134,19 @@ async def ensure_guild_setup(
             )
         voice_channels[mode] = voice_channel.id
 
+    end_queue_channel = _resolve_voice_channel(
+        guild,
+        category,
+        END_QUEUE_CHANNEL_NAME,
+        existing.end_queue_channel_id if existing else None,
+    )
+    if end_queue_channel is None:
+        end_queue_channel = await guild.create_voice_channel(
+            END_QUEUE_CHANNEL_NAME,
+            category=category,
+            user_limit=0,
+        )
+
     return GuildSetup(
         guild_id=guild.id,
         category_id=category.id,
@@ -141,6 +156,7 @@ async def ensure_guild_setup(
         elo_channel_id=elo_channel.id,
         elo_message_id=existing.elo_message_id if existing else None,
         voice_channels=voice_channels,
+        end_queue_channel_id=end_queue_channel.id,
     )
 
 

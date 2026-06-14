@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 
 from captain_flow import CaptainFlowState, CaptainPhase, CaptainTeam, _tally_winner
 from config import MatchMode
-from map_vote_flow import MapVoteFlowState
 from maps import PREMIER_VETO_POOL, map_display_name
 from matchzy import ActiveMatch, QueuedPlayer
 from premier_veto_flow import MatchSide, PremierVetoPhase, PremierVetoState
@@ -31,9 +30,6 @@ class Matchmaker:
     active_matches: dict[str, ActiveMatch] = field(default_factory=dict)
     captain_flows: dict[tuple[MatchMode, str], CaptainFlowState] = field(
         default_factory=lambda: defaultdict(CaptainFlowState)
-    )
-    map_vote_flows: dict[tuple[MatchMode, str], MapVoteFlowState] = field(
-        default_factory=lambda: defaultdict(MapVoteFlowState)
     )
     premier_veto_flows: dict[tuple[MatchMode, str], PremierVetoState] = field(
         default_factory=lambda: defaultdict(PremierVetoState)
@@ -109,9 +105,6 @@ class Matchmaker:
                     veto_flow = self.get_premier_veto_flow(mode, map_name)
                     if veto_flow.in_lobby(discord_id):
                         veto_flow.reset()
-                    map_flow = self.get_map_vote_flow(mode, map_name)
-                    if map_flow.in_lobby(discord_id):
-                        map_flow.reset()
                     self.maybe_start_captain_flow(mode, map_name)
                     if mode == MatchMode.ONE_V_ONE:
                         self.maybe_start_premier_veto_1v1(mode, map_name)
@@ -125,13 +118,6 @@ class Matchmaker:
     ) -> CaptainFlowState:
         return self.captain_flows[self.queue_key(mode, map_name)]
 
-    def get_map_vote_flow(
-        self,
-        mode: MatchMode,
-        map_name: str | None = None,
-    ) -> MapVoteFlowState:
-        return self.map_vote_flows[self.queue_key(mode, map_name)]
-
     def get_premier_veto_flow(
         self,
         mode: MatchMode,
@@ -141,9 +127,6 @@ class Matchmaker:
 
     def captains_required(self, mode: MatchMode) -> bool:
         return mode != MatchMode.ONE_V_ONE
-
-    def map_vote_required(self, mode: MatchMode) -> bool:
-        return False
 
     def premier_veto_required(self, mode: MatchMode) -> bool:
         return True
@@ -279,9 +262,6 @@ class Matchmaker:
             f"Premier map veto for {mode.label} on `{selected_map}` has been reset. "
             "Ready players can start again in #queue-status."
         )
-
-    def admin_reset_map_vote(self, mode: MatchMode, map_name: str | None = None) -> str:
-        return self.admin_reset_premier_veto(mode, map_name)
 
     def cast_captain_vote(
         self,
@@ -561,39 +541,6 @@ class Matchmaker:
         ]
         return self._create_match_from_entries(mode, map_name, selected)
 
-    def _create_match_from_draft(
-        self,
-        mode: MatchMode,
-        map_name: str,
-        flow: CaptainFlowState,
-    ) -> ActiveMatch | None:
-        self._begin_premier_veto_from_draft(mode, map_name, flow)
-        return None
-
-    def _create_match_from_map_vote(
-        self,
-        mode: MatchMode,
-        queue_map_name: str,
-        flow: MapVoteFlowState,
-        chosen_map: str,
-    ) -> ActiveMatch | None:
-        queue_key = (mode, queue_map_name)
-        ready_entries = self.get_ready_entries(mode, queue_map_name)
-        lobby_ids = set(flow.lobby_ids)
-        selected = [
-            entry for entry in ready_entries if entry.discord_id in lobby_ids
-        ][: mode.total_players]
-        if len(selected) < mode.total_players:
-            flow.reset()
-            return None
-
-        selected_ids = {entry.discord_id for entry in selected}
-        self.queues[queue_key] = [
-            entry for entry in self.queues[queue_key] if entry.discord_id not in selected_ids
-        ]
-        flow.reset()
-        return self._create_match_from_entries(mode, chosen_map, selected)
-
     def get_match(self, match_id: str) -> ActiveMatch | None:
         return self.active_matches.get(match_id)
 
@@ -722,7 +669,6 @@ class Matchmaker:
         removed_ids = [entry.discord_id for entry in self.queues[queue_key]]
         self.queues[queue_key].clear()
         self.get_captain_flow(mode, map_name).reset()
-        self.get_map_vote_flow(mode, map_name).reset()
         self.get_premier_veto_flow(mode, map_name).reset()
         return removed_ids
 

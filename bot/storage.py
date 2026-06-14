@@ -106,6 +106,9 @@ class Storage:
         if "elo_message_id" not in guild_columns:
             await db.execute("ALTER TABLE guild_settings ADD COLUMN elo_message_id INTEGER")
             await db.commit()
+        if "end_queue_channel_id" not in guild_columns:
+            await db.execute("ALTER TABLE guild_settings ADD COLUMN end_queue_channel_id INTEGER")
+            await db.commit()
 
         await db.execute(
             """
@@ -126,7 +129,7 @@ class Storage:
                 """
                 SELECT category_id, status_channel_id, status_message_id,
                        voice_1v1_id, voice_2v2_id, voice_5v5_id, results_channel_id,
-                       elo_channel_id, elo_message_id
+                       elo_channel_id, elo_message_id, end_queue_channel_id
                 FROM guild_settings
                 WHERE guild_id = ?
                 """,
@@ -137,6 +140,7 @@ class Storage:
                 return None
             results_channel_id = row[6] if row[6] is not None else 0
             elo_channel_id = row[7] if row[7] is not None else 0
+            end_queue_channel_id = row[9] if len(row) > 9 and row[9] is not None else 0
             return GuildSetup(
                 guild_id=guild_id,
                 category_id=row[0],
@@ -150,6 +154,7 @@ class Storage:
                     MatchMode.TWO_V_TWO: row[4],
                     MatchMode.FIVE_V_FIVE: row[5],
                 },
+                end_queue_channel_id=end_queue_channel_id,
             )
 
     async def save_guild_setup(self, setup) -> None:
@@ -161,8 +166,8 @@ class Storage:
                 INSERT INTO guild_settings (
                     guild_id, category_id, status_channel_id, status_message_id,
                     voice_1v1_id, voice_2v2_id, voice_5v5_id, results_channel_id,
-                    elo_channel_id, elo_message_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    elo_channel_id, elo_message_id, end_queue_channel_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     category_id = excluded.category_id,
                     status_channel_id = excluded.status_channel_id,
@@ -172,7 +177,8 @@ class Storage:
                     voice_5v5_id = excluded.voice_5v5_id,
                     results_channel_id = excluded.results_channel_id,
                     elo_channel_id = excluded.elo_channel_id,
-                    elo_message_id = excluded.elo_message_id
+                    elo_message_id = excluded.elo_message_id,
+                    end_queue_channel_id = excluded.end_queue_channel_id
                 """,
                 (
                     setup.guild_id,
@@ -185,6 +191,7 @@ class Storage:
                     setup.results_channel_id,
                     setup.elo_channel_id,
                     setup.elo_message_id,
+                    setup.end_queue_channel_id,
                 ),
             )
             await db.commit()
@@ -300,15 +307,28 @@ class Storage:
         match_id: str,
         team1_voice_id: int,
         team2_voice_id: int,
-    ) -> None:
+    ) -> bool:
         async with aiosqlite.connect(self.database_path) as db:
-            await db.execute(
+            cursor = await db.execute(
                 """
                 UPDATE matches
                 SET team1_voice_id = ?, team2_voice_id = ?
                 WHERE match_id = ?
                 """,
                 (team1_voice_id, team2_voice_id, match_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def clear_match_voice_channels(self, match_id: str) -> None:
+        async with aiosqlite.connect(self.database_path) as db:
+            await db.execute(
+                """
+                UPDATE matches
+                SET team1_voice_id = NULL, team2_voice_id = NULL
+                WHERE match_id = ?
+                """,
+                (match_id,),
             )
             await db.commit()
 
