@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -16,6 +17,35 @@ class DatHostServerInfo:
     game_port: int
     name: str
     online: bool
+    booting: bool = False
+    game_password: str | None = None
+
+    @property
+    def is_ready_for_players(self) -> bool:
+        return self.online and not self.booting
+
+
+def _extract_game_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    for key in ("cs2_settings", "csgo_settings"):
+        settings = payload.get(key)
+        if isinstance(settings, dict):
+            return settings
+    return {}
+
+
+def _extract_game_password(payload: dict[str, Any]) -> str | None:
+    settings = _extract_game_settings(payload)
+    password = settings.get("password")
+    if password is not None and str(password).strip():
+        return str(password).strip()
+    return None
+
+
+def _extract_connect_host(payload: dict[str, Any]) -> str:
+    custom_domain = str(payload.get("custom_domain") or "").strip()
+    if custom_domain:
+        return custom_domain
+    return str(payload.get("ip") or payload.get("host") or "").strip()
 
 
 class DatHostClient:
@@ -45,10 +75,51 @@ class DatHostClient:
         game_port = int(ports.get("game") or ports.get("game_port") or 27015)
         return DatHostServerInfo(
             server_id=self.server_id,
-            host=str(payload.get("ip") or ""),
+            host=_extract_connect_host(payload),
             game_port=game_port,
             name=str(payload.get("name") or "DatHost CS2 Server"),
             online=bool(payload.get("on") or payload.get("online")),
+            booting=bool(payload.get("booting")),
+            game_password=_extract_game_password(payload),
+        )
+
+    async def wait_until_ready(
+        self,
+        *,
+        timeout_seconds: int = 360,
+        poll_interval: int = 10,
+    ) -> DatHostServerInfo:
+        """Wait until DatHost reports the server online and not booting."""
+        attempts = max(1, timeout_seconds // poll_interval)
+        last_info: DatHostServerInfo | None = None
+
+        for attempt in range(attempts):
+            info = await self.get_server()
+            last_info = info
+            if info.is_ready_for_players:
+                if attempt > 0:
+                    logger.info(
+                        "DatHost server %s ready for players after ~%ss",
+                        info.server_id,
+                        attempt * poll_interval,
+                    )
+                return info
+
+            state = "booting" if info.booting else "offline"
+            logger.info(
+                "DatHost server %s not ready yet (%s, on=%s) — waiting %ss",
+                info.server_id,
+                state,
+                info.online,
+                poll_interval,
+            )
+            await asyncio.sleep(poll_interval)
+
+        if last_info is None:
+            raise TimeoutError("DatHost server status could not be retrieved")
+        raise TimeoutError(
+            f"DatHost server {last_info.server_id} still not ready "
+            f"(on={last_info.online}, booting={last_info.booting})"
         )
 
     async def console_send(self, line: str) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from typing import Union
 
@@ -17,8 +18,11 @@ from matchzy_events import (
     parse_webhook_json,
 )
 from storage import Storage
+from utils import build_join_redirect_html
 
 logger = logging.getLogger(__name__)
+
+_JOIN_HOST_PATTERN = re.compile(r"^[a-zA-Z0-9.\-]+$")
 
 
 MatchEventHandler = Callable[[dict], Union[Awaitable[None], None]]
@@ -39,6 +43,7 @@ class MatchHttpServer:
         self.app = web.Application()
         self.app.router.add_get("/", self.root)
         self.app.router.add_get("/health", self.health)
+        self.app.router.add_get("/join", self.join_server)
         self.app.router.add_get("/matches/{match_id}.json", self.get_match_config)
         self.app.router.add_post("/matchzy/events", self.post_match_event)
 
@@ -47,6 +52,23 @@ class MatchHttpServer:
 
     async def health(self, request: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
+
+    async def join_server(self, request: web.Request) -> web.Response:
+        host = request.query.get("host", "").strip()
+        port_raw = request.query.get("port", "").strip()
+        password = request.query.get("password", "").strip() or None
+
+        if not host or not _JOIN_HOST_PATTERN.fullmatch(host):
+            raise web.HTTPBadRequest(text="Invalid or missing host")
+        try:
+            port = int(port_raw)
+        except ValueError as exc:
+            raise web.HTTPBadRequest(text="Invalid or missing port") from exc
+        if not 1 <= port <= 65535:
+            raise web.HTTPBadRequest(text="Port out of range")
+
+        body = build_join_redirect_html(host, port, password)
+        return web.Response(text=body, content_type="text/html")
 
     async def get_match_config(self, request: web.Request) -> web.Response:
         match_id = request.match_info["match_id"]

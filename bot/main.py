@@ -26,6 +26,7 @@ class _BotAccessLogFilter(logging.Filter):
 
     _KEEP_FRAGMENTS = (
         "/health",
+        "/join",
         "/matches/",
         "/matchzy/events",
     )

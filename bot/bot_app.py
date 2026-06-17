@@ -1367,13 +1367,27 @@ class MatchBot(commands.Bot):
             try:
                 info = await client.get_server()
                 await client.console_send("echo CS2 Match Bot connection test")
-                await self.connect_resolver.refresh_dathost_connect_info()
+                info = await client.wait_until_ready(timeout_seconds=120)
+                self.connect_resolver.apply_server_info(info)
             except Exception as exc:
                 return f"DatHost connection failed: `{exc}`"
 
+            host = self.connect_resolver.get_connect_host()
+            port = self.connect_resolver.get_connect_port()
+            password = self.connect_resolver.get_connect_password()
+            password_note = "yes" if password else "no (open server — normal if DatHost has no password)"
+            from utils import is_valid_connect_host
+
+            if not is_valid_connect_host(host):
+                return (
+                    f"DatHost API OK but **connect address is invalid** (`{host}`).\n"
+                    f"Set `CS2_PUBLIC_HOST` and `CS2_PUBLIC_PORT` in `.env` using values "
+                    f"from the DatHost control panel."
+                )
+
             return (
-                f"DatHost server **{info.name}** is reachable "
-                f"(`{info.host}:{info.game_port}`)."
+                f"DatHost **{info.name}** — online ✅ (booting finished)\n"
+                f"Players connect to `{host}:{port}` (password configured: {password_note})."
             )
 
         try:
@@ -1634,16 +1648,26 @@ class MatchBot(commands.Bot):
         public_host = self.connect_resolver.get_connect_host()
         public_port = self.connect_resolver.get_connect_port()
         server_password = self.connect_resolver.get_connect_password()
+        connect_ready = self.connect_resolver.is_connect_ready()
+
+        description_lines = [
+            "You have been moved to your **team voice channel**. "
+            "Only players in this match can join CT/T voice. "
+            "Connect to the CS2 server — MatchZy assigns your in-game team from your linked Steam ID.",
+        ]
+        if connect_ready:
+            description_lines.append(
+                "✅ **Server is online** — connect below, then type `.ready` in game chat."
+            )
+        else:
+            description_lines.append(
+                "⏳ **Server is still starting** — wait ~30s and use the connect command below."
+            )
+        description_lines.append(f"Match ID: `{match.match_id}`")
 
         embed = discord.Embed(
             title=f"{match.mode.label} match ready",
-            description=(
-                "You have been moved to your **team voice channel**. "
-                "Only players in this match can join CT/T voice. "
-                "Connect to the CS2 server — MatchZy assigns your in-game team from your linked Steam ID.\n"
-                "Type `.ready` in game chat when connected.\n"
-                f"Match ID: `{match.match_id}`"
-            ),
+            description="\n".join(description_lines),
             color=discord.Color.green(),
         )
         alpha_side = match.team1_side
@@ -1657,7 +1681,12 @@ class MatchBot(commands.Bot):
         embed.add_field(name="Map", value=f"`{match.map_name}`", inline=True)
         embed.add_field(
             name="Join server",
-            value=build_server_connect_field(public_host, public_port, server_password or None),
+            value=build_server_connect_field(
+                public_host,
+                public_port,
+                server_password or None,
+                public_url=self.settings.public_url,
+            ),
             inline=False,
         )
         if team1_voice_id is not None and team2_voice_id is not None:
@@ -1680,7 +1709,12 @@ class MatchBot(commands.Bot):
         public_host = self.connect_resolver.get_connect_host()
         public_port = self.connect_resolver.get_connect_port()
         server_password = self.connect_resolver.get_connect_password()
-        return build_server_connect_field(public_host, public_port, server_password or None)
+        return build_server_connect_field(
+            public_host,
+            public_port,
+            server_password or None,
+            public_url=self.settings.public_url,
+        )
 
     def _queue_should_show_server_connect(self, default_map: str) -> bool:
         if self.matchmaker.active_matches:
@@ -2383,7 +2417,17 @@ class MatchBot(commands.Bot):
 
         await self.storage.clear_live_results_message_id(match_id)
 
-    async def _ensure_dathost_server_ready(self) -> None:
+    async def _get_dathost_client(self):
+        from dathost_client import DatHostClient
+
+        return DatHostClient(
+            email=self.settings.dathost_email or "",
+            password=self.settings.dathost_password or "",
+            server_id=self.settings.dathost_game_server_id or "",
+            base_url=self.settings.dathost_api_base,
+        )
+
+    async def _ensure_dathost_server_ready(self, *, context: str = "match") -> None:
         if self.settings.server_provider != ServerProvider.DATHOST:
             return
         if (
@@ -2391,21 +2435,26 @@ class MatchBot(commands.Bot):
             or not self.settings.dathost_password
             or not self.settings.dathost_game_server_id
         ):
-            return
+            raise RuntimeError(
+                "DatHost is not configured (DATHOST_EMAIL, DATHOST_PASSWORD, "
+                "DATHOST_GAME_SERVER_ID)."
+            )
 
-        from dathost_client import DatHostClient
-
-        client = DatHostClient(
-            email=self.settings.dathost_email,
-            password=self.settings.dathost_password,
-            server_id=self.settings.dathost_game_server_id,
-            base_url=self.settings.dathost_api_base,
-        )
+        client = await self._get_dathost_client()
         info = await client.get_server()
         if not info.online:
-            logger.info("Starting DatHost server %s", info.server_id)
+            logger.info("Starting DatHost server %s (%s)", info.server_id, context)
             await client.start_server()
-        await self.connect_resolver.refresh_dathost_connect_info()
+
+        info = await client.wait_until_ready()
+        self.connect_resolver.apply_server_info(info)
+        logger.info(
+            "DatHost server %s ready for players at %s:%s (%s)",
+            info.server_id,
+            self.connect_resolver.get_connect_host(),
+            self.connect_resolver.get_connect_port(),
+            context,
+        )
 
     async def announce_match(self, guild: discord.Guild, match: ActiveMatch) -> None:
         self._cancel_queue_ready_timer(match.mode, match.map_name)
@@ -2424,9 +2473,10 @@ class MatchBot(commands.Bot):
             return
 
         try:
-            await self._ensure_dathost_server_ready()
+            await self._ensure_dathost_server_ready(context="pre-deploy")
             responses = await self.matchzy.deploy_match(match)
             logger.info("Match %s deployed (%s)", match.match_id, "; ".join(responses))
+            await self._ensure_dathost_server_ready(context="post-deploy")
         except Exception as exc:
             logger.exception("Failed to deploy match %s", match.match_id)
             await self._rollback_failed_match(guild, match, exc)
