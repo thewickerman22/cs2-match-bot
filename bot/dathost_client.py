@@ -19,6 +19,9 @@ class DatHostServerInfo:
     online: bool
     booting: bool = False
     game_password: str | None = None
+    ip: str | None = None
+    custom_domain: str | None = None
+    private_server: bool = False
 
     @property
     def is_ready_for_players(self) -> bool:
@@ -41,11 +44,21 @@ def _extract_game_password(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def _extract_connect_host(payload: dict[str, Any]) -> str:
-    custom_domain = str(payload.get("custom_domain") or "").strip()
-    if custom_domain:
-        return custom_domain
-    return str(payload.get("ip") or payload.get("host") or "").strip()
+def _extract_connect_endpoints(payload: dict[str, Any], *, prefer_ip: bool) -> tuple[str, str | None, str | None]:
+    ip = str(payload.get("ip") or "").strip() or None
+    custom_domain = str(payload.get("custom_domain") or "").strip() or None
+    fallback = str(payload.get("host") or "").strip() or None
+
+    if prefer_ip:
+        host = ip or custom_domain or fallback or ""
+    else:
+        host = custom_domain or ip or fallback or ""
+    return host, ip, custom_domain
+
+
+def _extract_private_server(payload: dict[str, Any]) -> bool:
+    settings = _extract_game_settings(payload)
+    return bool(settings.get("private_server"))
 
 
 class DatHostClient:
@@ -64,7 +77,7 @@ class DatHostClient:
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self._auth = aiohttp.BasicAuth(email, password)
 
-    async def get_server(self) -> DatHostServerInfo:
+    async def get_server(self, *, prefer_ip: bool = True) -> DatHostServerInfo:
         url = f"{self.base_url}/game-servers/{self.server_id}"
         async with aiohttp.ClientSession(timeout=self.timeout, auth=self._auth) as session:
             async with session.get(url) as response:
@@ -73,14 +86,18 @@ class DatHostClient:
 
         ports = payload.get("ports") or {}
         game_port = int(ports.get("game") or ports.get("game_port") or 27015)
+        host, ip, custom_domain = _extract_connect_endpoints(payload, prefer_ip=prefer_ip)
         return DatHostServerInfo(
             server_id=self.server_id,
-            host=_extract_connect_host(payload),
+            host=host,
             game_port=game_port,
             name=str(payload.get("name") or "DatHost CS2 Server"),
             online=bool(payload.get("on") or payload.get("online")),
             booting=bool(payload.get("booting")),
             game_password=_extract_game_password(payload),
+            ip=ip,
+            custom_domain=custom_domain,
+            private_server=_extract_private_server(payload),
         )
 
     async def wait_until_ready(

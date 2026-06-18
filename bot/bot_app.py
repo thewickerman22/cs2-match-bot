@@ -120,6 +120,7 @@ class MatchBot(commands.Bot):
         self._match_result_votes: dict[str, dict[str, set[int]]] = {}
         self._match_player_end_votes: dict[str, set[int]] = {}
         self._match_status_poll_tasks: dict[str, asyncio.Task] = {}
+        self._match_connect_refresh_tasks: dict[str, asyncio.Task] = {}
         self._queue_ready_deadlines: dict[tuple[MatchMode, str], float] = {}
         self._queue_status_refresh_task: asyncio.Task | None = None
         self._queue_join_block_notified: dict[int, set[str]] = {}
@@ -171,7 +172,7 @@ class MatchBot(commands.Bot):
         if season_reset:
             await self._announce_elo_season_reset(guild, season)
         await self.refresh_elo_leaderboard(guild, season=season)
-        await self.connect_resolver.refresh_dathost_connect_info()
+        await self.connect_resolver.refresh_dathost_connect_info(force=True)
         await self._register_live_match_report_views()
         await self._restart_active_match_polls(guild)
 
@@ -1365,7 +1366,7 @@ class MatchBot(commands.Bot):
                 base_url=self.settings.dathost_api_base,
             )
             try:
-                info = await client.get_server()
+                info = await client.get_server(prefer_ip=self.settings.cs2_connect_prefer_ip)
                 await client.console_send("echo CS2 Match Bot connection test")
                 info = await client.wait_until_ready(timeout_seconds=120)
                 self.connect_resolver.apply_server_info(info)
@@ -1376,7 +1377,7 @@ class MatchBot(commands.Bot):
             port = self.connect_resolver.get_connect_port()
             password = self.connect_resolver.get_connect_password()
             password_note = "yes" if password else "no (open server — normal if DatHost has no password)"
-            from utils import is_valid_connect_host
+            from utils import build_connect_command, is_valid_connect_host
 
             if not is_valid_connect_host(host):
                 return (
@@ -1385,10 +1386,29 @@ class MatchBot(commands.Bot):
                     f"from the DatHost control panel."
                 )
 
-            return (
-                f"DatHost **{info.name}** — online ✅ (booting finished)\n"
-                f"Players connect to `{host}:{port}` (password configured: {password_note})."
-            )
+            udp_ok = await self.connect_resolver.probe_game_port()
+            lines = [
+                f"DatHost **{info.name}** — online ✅ (booting finished)",
+                f"Connect: `{host}:{port}` (password: {password_note})",
+            ]
+            if info.ip and info.ip != host:
+                lines.append(f"IP fallback: `{info.ip}:{port}`")
+            if info.custom_domain and info.custom_domain != host:
+                lines.append(f"Domain: `{info.custom_domain}:{port}`")
+            if info.private_server:
+                lines.append(
+                    "_Private server is ON (hidden from browser — direct connect still works)._"
+                )
+            if udp_ok:
+                lines.append("UDP game port ✅ responding — server is joinable from the internet.")
+            else:
+                lines.append(
+                    "UDP game port ❌ **not responding** — players will get timeout (error 5003).\n"
+                    "Check DatHost panel: server must be **Started**, not booting, correct **game port**.\n"
+                    f"Manual test from CS2 main menu console:\n"
+                    f"`{build_connect_command(host, port, password)}`"
+                )
+            return "\n".join(lines)
 
         try:
             response = await self.matchzy.console.execute("echo CS2 Match Bot connection test")
@@ -1661,7 +1681,8 @@ class MatchBot(commands.Bot):
             )
         else:
             description_lines.append(
-                "⏳ **Server is still starting** — wait ~30s and use the connect command below."
+                "⏳ **Map is loading** — MatchZy reloads the server when a match starts. "
+                "Wait until this message says **Server is online** (usually 30–90s), then connect."
             )
         description_lines.append(f"Match ID: `{match.match_id}`")
 
@@ -1686,6 +1707,7 @@ class MatchBot(commands.Bot):
                 public_port,
                 server_password or None,
                 public_url=self.settings.public_url,
+                alternate_host=self.connect_resolver.get_connect_alternate_host(),
             ),
             inline=False,
         )
@@ -1714,6 +1736,7 @@ class MatchBot(commands.Bot):
             public_port,
             server_password or None,
             public_url=self.settings.public_url,
+            alternate_host=self.connect_resolver.get_connect_alternate_host(),
         )
 
     def _queue_should_show_server_connect(self, default_map: str) -> bool:
@@ -2105,6 +2128,9 @@ class MatchBot(commands.Bot):
 
         self._cancel_match_finish_fallback(match_id)
         self._cancel_match_status_poll(match_id)
+        connect_refresh = self._match_connect_refresh_tasks.pop(match_id, None)
+        if connect_refresh is not None:
+            connect_refresh.cancel()
         self._match_result_votes.pop(match_id, None)
         self._match_player_end_votes.pop(match_id, None)
 
@@ -2441,7 +2467,7 @@ class MatchBot(commands.Bot):
             )
 
         client = await self._get_dathost_client()
-        info = await client.get_server()
+        info = await client.get_server(prefer_ip=self.settings.cs2_connect_prefer_ip)
         if not info.online:
             logger.info("Starting DatHost server %s (%s)", info.server_id, context)
             await client.start_server()
@@ -2473,10 +2499,36 @@ class MatchBot(commands.Bot):
             return
 
         try:
+            self.connect_resolver.mark_match_deploy_started()
             await self._ensure_dathost_server_ready(context="pre-deploy")
             responses = await self.matchzy.deploy_match(match)
             logger.info("Match %s deployed (%s)", match.match_id, "; ".join(responses))
             await self._ensure_dathost_server_ready(context="post-deploy")
+            settle = self.settings.dathost_post_deploy_settle_seconds
+            if settle > 0:
+                logger.info(
+                    "Waiting %ss for MatchZy map reload before UDP readiness check",
+                    settle,
+                )
+                await asyncio.sleep(settle)
+            udp_ok = await self.connect_resolver.wait_for_game_port()
+            if udp_ok:
+                logger.info(
+                    "Game port ready for match %s at %s:%s",
+                    match.match_id,
+                    self.connect_resolver.get_connect_host(),
+                    self.connect_resolver.get_connect_port(),
+                )
+                finalize = await self.matchzy.finalize_match_deploy(match)
+                logger.info("Match %s finalized (%s)", match.match_id, "; ".join(finalize))
+            else:
+                logger.warning(
+                    "Game port %s:%s not responding after match %s deploy — "
+                    "will keep polling before players connect",
+                    self.connect_resolver.get_connect_host(),
+                    self.connect_resolver.get_connect_port(),
+                    match.match_id,
+                )
         except Exception as exc:
             logger.exception("Failed to deploy match %s", match.match_id)
             await self._rollback_failed_match(guild, match, exc)
@@ -2500,7 +2552,96 @@ class MatchBot(commands.Bot):
                 logger.warning("Could not DM Discord user %s", player.discord_id)
 
         await self._post_live_match_embed(guild, match)
+        if not self.connect_resolver.is_connect_ready():
+            self._schedule_match_connect_refresh(guild, match, team1_voice_id, team2_voice_id)
         await self._schedule_match_status_poll(guild, match.match_id)
+        await self.refresh_queue_status(guild)
+
+    def _schedule_match_connect_refresh(
+        self,
+        guild: discord.Guild,
+        match: ActiveMatch,
+        team1_voice_id: int | None,
+        team2_voice_id: int | None,
+    ) -> None:
+        existing = self._match_connect_refresh_tasks.pop(match.match_id, None)
+        if existing is not None:
+            existing.cancel()
+
+        async def _poll() -> None:
+            try:
+                while match.match_id in self.matchmaker.active_matches:
+                    if await self.connect_resolver.wait_for_game_port(
+                        timeout_seconds=self.settings.dathost_udp_poll_seconds * 2,
+                        poll_interval=self.settings.dathost_udp_poll_seconds,
+                    ):
+                        logger.info(
+                            "Game port became ready for match %s — refreshing connect info",
+                            match.match_id,
+                        )
+                        await self._refresh_match_connect_messages(
+                            guild,
+                            match,
+                            team1_voice_id,
+                            team2_voice_id,
+                        )
+                        return
+                    await asyncio.sleep(self.settings.dathost_udp_poll_seconds)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Match connect refresh task failed for match %s",
+                    match.match_id,
+                )
+
+        self._match_connect_refresh_tasks[match.match_id] = asyncio.create_task(_poll())
+
+    async def _refresh_match_connect_messages(
+        self,
+        guild: discord.Guild,
+        match: ActiveMatch,
+        team1_voice_id: int | None,
+        team2_voice_id: int | None,
+    ) -> None:
+        embed = self._build_match_embed(match, team1_voice_id, team2_voice_id)
+        setup = self.guild_setups.get(guild.id)
+        if setup is not None:
+            channel = guild.get_channel(setup.status_channel_id)
+            message_id = self._match_status_messages.get(match.match_id)
+            if isinstance(channel, discord.TextChannel) and message_id is not None:
+                try:
+                    message = await channel.fetch_message(message_id)
+                    await message.edit(embed=embed)
+                except (discord.NotFound, discord.HTTPException):
+                    pass
+
+        snapshot = self._live_match_snapshots.get(match.match_id)
+        if snapshot is not None:
+            snapshot.status = "Server online — connect and type .ready"
+            display = await self._get_match_display_data(match.match_id)
+            results_channel = await self._get_results_channel(guild)
+            message_id = await self.storage.get_live_results_message_id(match.match_id)
+            if display is not None and results_channel is not None and message_id is not None:
+                mode, map_name, team1_ids, team2_ids, team1_names, team2_names = display
+                embed = build_live_match_embed(
+                    match.match_id,
+                    mode,
+                    map_name,
+                    team1_ids,
+                    team2_ids,
+                    team1_names,
+                    team2_names,
+                    snapshot,
+                    server_connect_field=self._server_connect_field(),
+                )
+                view = self._live_match_report_view(match.match_id)
+                try:
+                    message = await results_channel.fetch_message(message_id)
+                    await message.edit(embed=embed, view=view)
+                except (discord.NotFound, discord.HTTPException):
+                    pass
+
         await self.refresh_queue_status(guild)
 
     async def _clear_match_status_message(self, guild: discord.Guild, match_id: str) -> None:

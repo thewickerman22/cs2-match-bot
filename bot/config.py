@@ -66,6 +66,11 @@ class Settings:
     queue_status_refresh_seconds: int
     transient_message_seconds: int
     match_results_retain_count: int
+    dathost_post_deploy_settle_seconds: int
+    dathost_connect_refresh_seconds: int
+    dathost_udp_ready_timeout_seconds: int
+    dathost_udp_poll_seconds: int
+    cs2_connect_prefer_ip: bool
 
 
 def load_settings() -> Settings:
@@ -113,4 +118,16 @@ def load_settings() -> Settings:
         queue_status_refresh_seconds=int(os.getenv("QUEUE_STATUS_REFRESH_SECONDS", "15")),
         transient_message_seconds=int(os.getenv("TRANSIENT_MESSAGE_SECONDS", "5")),
         match_results_retain_count=int(os.getenv("MATCH_RESULTS_RETAIN_COUNT", "5")),
+        dathost_post_deploy_settle_seconds=int(
+            os.getenv("DATHOST_POST_DEPLOY_SETTLE_SECONDS", "45")
+        ),
+        dathost_connect_refresh_seconds=int(
+            os.getenv("DATHOST_CONNECT_REFRESH_SECONDS", "60")
+        ),
+        dathost_udp_ready_timeout_seconds=int(
+            os.getenv("DATHOST_UDP_READY_TIMEOUT_SECONDS", "120")
+        ),
+        dathost_udp_poll_seconds=int(os.getenv("DATHOST_UDP_POLL_SECONDS", "5")),
+        cs2_connect_prefer_ip=os.getenv("CS2_CONNECT_PREFER_IP", "true").strip().lower()
+        in {"1", "true", "yes", "on"},
     )

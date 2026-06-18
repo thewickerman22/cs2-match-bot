@@ -23,8 +23,11 @@ flowchart LR
 3. Players join a queue voice channel and react **✅** on `#queue-status` when ready.
 4. When enough players are ready, the bot runs captain selection (2v2/5v5), Premier map veto, and side pick (CT/T).
 5. The bot generates MatchZy match JSON and loads it on the server.
-6. Players connect to the CS2 server and use MatchZy in-game commands like `.ready`.
-7. MatchZy sends webhooks when the map/series ends — the bot posts results, updates ELO, and cleans up voice channels.
+6. The bot waits for the game port to accept connections, then posts connect info (HTTPS join link + console command).
+7. Players connect to the CS2 server and type `.ready` in game chat (MatchZy warmup).
+8. MatchZy sends webhooks when the map/series ends — the bot posts results, updates ELO, and cleans up voice channels.
+
+**DatHost requirement:** the game server must reach your bot at **`BOT_PUBLIC_URL` over HTTPS (port 443)** to download match JSON. Without that, maps will not change and roster kicks may occur.
 
 ## Prerequisites
 
@@ -108,9 +111,15 @@ Set `CS2_HOST=cs2-server` in `.env` when using Docker Compose.
 | `MATCH_RESULTS_RETAIN_COUNT` | Keep the last N result posts in `#match-results` (default `5`) |
 | `ELO_DEFAULT` | Starting ELO for new players (default `1000`) |
 | `ELO_K_FACTOR` | ELO K-factor per match (default `32`) |
-| `CS2_PUBLIC_HOST` | Public IP or hostname players use in `connect` (optional) |
-| `CS2_PW` | Server password shown to players (optional) |
-| `MATCHZY_ADMINS` | Comma-separated Steam64 IDs for in-game MatchZy admins |
+| `CS2_PUBLIC_HOST` | Public IP or hostname for `connect` (recommended on DatHost if API returns a hostname) |
+| `CS2_PUBLIC_PORT` | Game port override (optional; otherwise from DatHost API) |
+| `CS2_PW` | Server password shown to players (optional; leave empty for open servers) |
+| `CS2_CONNECT_PREFER_IP` | Prefer numeric IP from DatHost API for connect commands (default `true`) |
+| `DATHOST_POST_DEPLOY_SETTLE_SECONDS` | Wait after `matchzy_loadmatch_url` before UDP check (default `45`) |
+| `DATHOST_UDP_READY_TIMEOUT_SECONDS` | Max seconds to poll until game port responds (default `120`) |
+| `DATHOST_UDP_POLL_SECONDS` | Interval between UDP readiness polls (default `5`) |
+| `DATHOST_CONNECT_REFRESH_SECONDS` | Min seconds between DatHost connect-info API polls (default `60`) |
+| `MATCHZY_ADMINS` | Comma-separated Steam64 IDs for in-game MatchZy admins (local server only) |
 
 #### Discord bot invite
 
@@ -163,7 +172,7 @@ Pinned admin panel in **#bot-commands**:
 | **Refresh Setup** (button) | Create or refresh all matchmaking channels and panels |
 | 🛑 | End active match (no ELO, cleanup voice) |
 | ▶️ | Force-start MatchZy on the server |
-| 🔌 | Test server connection (RCON / DatHost) |
+| 🔌 | Test DatHost + UDP game port reachability; shows connect address |
 | 1️⃣ / 2️⃣ / 5️⃣ | Reset lobby captain draft for 1v1 / 2v2 / 5v5 |
 
 **Refresh Setup** requires bot admin role, server administrator, or **Manage Channels**.
@@ -187,7 +196,11 @@ Set `DISCORD_ADMIN_ROLE_ID` in `.env` to grant the admin role without Discord se
 
 Leave a queue voice channel to leave the queue.
 
-When a match starts, the bot creates temporary **CT** and **T** voice channels and moves players to their assigned side. When the match ends (MatchZy webhook, player report, or admin 🛑), players move to **End Queue**, team channels are deleted, and the result is posted to `#match-results`.
+When a match starts, the bot creates temporary **CT** and **T** voice channels and moves players to their assigned side. The match embed includes a **Launch CS2 and Join** link (opens `/join` on your bot, then Steam) and a `connect host:port` console command.
+
+**Wait for “Server is online”** in Discord before connecting — MatchZy reloads the map when a match deploys and the UDP port is closed for 30–90 seconds.
+
+When the match ends (MatchZy webhook, player report, or admin 🛑), players move to **End Queue**, team channels are deleted, and the result is posted to `#match-results`.
 
 ## Supported maps
 
@@ -221,10 +234,17 @@ The bot communicates with MatchZy using:
 
 - **Local server:** TCP RCON (`CS2_HOST`, `CS2_PORT`, `CS2_RCON_PASSWORD`)
 - **DatHost server:** [DatHost Console API](https://dathost.net/docs) (MatchZy commands sent to server console)
-- **HTTP JSON** at `GET /matches/{match_id}.json` for match configuration
-- **Webhooks** at `POST /matchzy/events` for live scores, match finish, voice cleanup, and ELO
+- **HTTP JSON** at `GET /matches/{match_id}.json?key=MATCHZY_API_KEY` (auth via query string — DatHost fetches this URL)
+- **Webhooks** at `POST /matchzy/events` with header `X-API-Key: MATCHZY_API_KEY`
 
-Match JSON includes the veto-selected map, CT/T side assignment (`map_sides`), and `skip_veto: true`. Forfeit-on-disconnect is disabled in match config (`matchzy_ffw_enabled: 0`).
+On match deploy (DatHost), the bot:
+
+1. Clears any previous MatchZy state (`css_endmatch`, etc.)
+2. Enters match mode (`css_match`)
+3. Sends `matchzy_loadmatch_url` with the full HTTPS JSON URL (including `?key=`)
+4. Waits for the game UDP port to respond, then sets `css_readyrequired`
+
+Match JSON includes the veto-selected map, CT/T side assignment (`map_sides`), roster Steam64 IDs, and `skip_veto: true`. Forfeit-on-disconnect is disabled in match JSON cvars where supported.
 
 **DatHost (public HTTPS):** edit `csgo/cfg/MatchZy/config.cfg` on the game server via FTP:
 
@@ -249,6 +269,8 @@ matchzy_gg_enabled 0
 ```
 
 Restart the CS2 server after editing MatchZy config.
+
+Some DatHost MatchZy builds do not support `matchzy_ffw_enabled` / `matchzy_gg_enabled` as console commands — set them in `config.cfg` only (ignore `Unknown command` in the server console).
 
 For **DatHost**, see [cs2/dathost-setup.md](cs2/dathost-setup.md).
 
@@ -288,28 +310,63 @@ docker compose up -d match-bot
 docker compose logs -f match-bot
 ```
 
-### 4. Reverse proxy
+### 4. Reverse proxy (required for DatHost)
 
-Expose the bot on **HTTPS** (port 443). Example nginx location:
+The bot listens on **8080** inside Docker. DatHost must reach **`https://your-domain`** on port **443**. Do not expose 8080 publicly — use nginx (or Caddy) on the VPS.
+
+**AWS:** open inbound **80/tcp** and **443/tcp** on the instance security group.
+
+**Install nginx + SSL (Ubuntu example):**
+
+```bash
+sudo apt install -y nginx certbot python3-certbot-nginx
+sudo nano /etc/nginx/sites-available/cs2-match-bot
+```
 
 ```nginx
-location / {
-    proxy_pass http://127.0.0.1:8080;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
+server {
+    listen 80;
+    server_name your-domain.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
 }
 ```
 
-Set `BOT_PUBLIC_URL` to your public HTTPS URL (e.g. `https://your-domain.example.com`).
+```bash
+sudo ln -sf /etc/nginx/sites-available/cs2-match-bot /etc/nginx/sites-enabled/
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
+sudo certbot --nginx -d your-domain.example.com
+```
+
+Set `BOT_PUBLIC_URL=https://your-domain.example.com` in `.env` and restart the bot.
+
+**Optional DatHost connect overrides** (if players timeout or hostname fails):
+
+```env
+CS2_PUBLIC_HOST=123.45.67.89
+CS2_PUBLIC_PORT=27015
+CS2_PW=
+```
 
 ### 5. Verify
 
 ```bash
 curl -s http://127.0.0.1:8080/health
 curl -s https://your-domain.example.com/health
+curl -s "https://your-domain.example.com/matches/1.json?key=YOUR_MATCHZY_API_KEY" | head
 ```
 
-Both should return `{"status":"ok"}`.
+All should succeed. The third command must return match JSON (401 means wrong `MATCHZY_API_KEY`).
+
+DatHost console should show `[LoadMatchFromURL] Received following data:` — not `Connection refused`.
 
 ### 6. DatHost + Discord
 
@@ -342,18 +399,45 @@ Run the CS2 server separately with Docker Compose, or point `CS2_HOST`/`CS2_PORT
 
 ## Troubleshooting
 
+### DatHost / HTTPS / match load
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| DatHost: `Connection refused (your-domain:443)` | HTTPS not working | Fix nginx + certbot; open AWS port 443 |
+| HTTPS **502 Bad Gateway** | Bot container down | `docker compose up -d match-bot`; check `curl http://127.0.0.1:8080/health` |
+| Map stays on `de_dust2` / no roster | Match JSON never loaded | Fix HTTPS; check DatHost for `[LoadMatchFromURL]` errors |
+| Bot log: no `Serving match JSON for N` | DatHost never fetched JSON | Same as above |
+| `Unauthorized match JSON request` | Wrong API key | Match `MATCHZY_API_KEY` in `.env` with URL `?key=` and webhook `config.cfg` |
+
+### Connect / join
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Timeout **5003**, `Recv: 0 pkts` | Joined during map reload or port closed | Wait for **Server is online** in Discord (~30–90s after match start) |
+| Connect works after reboot, fails on match | Map reload closes UDP briefly | Expected — wait for bot ready signal |
+| Works with IP, not hostname | DNS / client issue | Set `CS2_PUBLIC_HOST` to numeric IP from DatHost panel |
+
+### MatchZy / kicks
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `KICKING PLAYER ... (NOT ALLOWED!)` | Steam64 not in match roster | Re-link correct **steamID64** from [steamid.io](https://steamid.io); only queued players can join |
+| Kicked when no match loaded | `matchzy_kick_when_no_match_loaded 1` | Set to `0` in DatHost `config.cfg`, reboot server |
+| `Unknown command 'matchzy_ffw_enabled'` | Older MatchZy build | Set ffw/gg in `config.cfg` only — harmless |
+
+### Bot / Discord
+
 - **RCON authentication failed**: Check `CS2_RCON_PASSWORD` (local) or react 🔌 on the admin panel (DatHost).
 - **DatHost commands not working**: Ensure MatchZy is installed and `DATHOST_*` credentials are correct.
-- **Match JSON load fails on DatHost**: `BOT_PUBLIC_URL` must be a public **HTTPS** URL reachable from the internet.
-- **Match JSON 401**: `MATCHZY_API_KEY` must match the header in DatHost `config.cfg` and `matchzy_loadmatch_url`.
-- **Players kicked as NOT ALLOWED**: They must join with the exact Steam64 ID linked in Discord.
 - **Voice queue not detected after restart**: Click **Refresh Setup** or restart the bot with `DISCORD_GUILD_ID` set.
 - **Ready reaction does nothing**: Join a queue voice channel first and link Steam.
-- **Deploy import errors on server**: Sync the entire `bot/` folder before rebuilding — partial uploads cause crashes. The Docker build runs `compileall` to catch syntax errors early.
-- **Match ends in-game but voice channels stay / no ELO**: Webhooks are not reaching the bot. Look for `POST /matchzy/events` and `MatchZy event received: series_end` in `docker compose logs match-bot`. Fix `matchzy_remote_log_url` on the CS2 server. **Workaround:** **Report** buttons on the `#match-results` live embed, or admin 🛑.
-- **Live score stuck on “Score pending”**: Same root cause — `round_end` webhooks not arriving.
-- **`#queue-status` not updating during lobby**: Embed refreshes on every action and every `QUEUE_STATUS_REFRESH_SECONDS` during lobby phases.
+- **Deploy import errors on server**: Sync the entire `bot/` folder before rebuilding — partial uploads cause crashes.
+- **Match ends in-game but voice channels stay / no ELO**: Webhooks not reaching the bot. Look for `POST /matchzy/events` and `series_end` in logs. Fix `matchzy_remote_log_url` on the CS2 server. **Workaround:** **Report** buttons on the live embed, or admin 🛑.
+- **Live score stuck on “Score pending”**: Same as above — `round_end` webhooks not arriving.
+- **Discord 429 rate limits on `#queue-status`**: Increase `QUEUE_STATUS_REFRESH_SECONDS` (e.g. `30`).
 - **Logs full of scanner probes**: Normal internet noise — harmless 404s; the bot filters most of this.
+
+**Private server** on DatHost only hides the server from the public browser — it does not block direct `connect`. Kicks with **NOT ALLOWED** are roster/Steam ID issues, not the private-server setting.
 
 ## Project layout
 
@@ -385,6 +469,7 @@ cs2-match-bot/
 │   ├── dathost_client.py
 │   ├── server_console.py
 │   ├── server_connect.py
+│   ├── server_query.py
 │   ├── matchmaker.py
 │   ├── matchzy.py
 │   ├── maps.py

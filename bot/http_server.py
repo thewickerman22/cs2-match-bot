@@ -72,7 +72,17 @@ class MatchHttpServer:
 
     async def get_match_config(self, request: web.Request) -> web.Response:
         match_id = request.match_info["match_id"]
-        if request.headers.get("X-API-Key") != self.settings.matchzy_api_key:
+        api_key = (
+            request.headers.get("X-API-Key")
+            or request.query.get("key")
+            or ""
+        )
+        if api_key != self.settings.matchzy_api_key:
+            logger.warning(
+                "Unauthorized match JSON request for %s from %s",
+                match_id,
+                request.remote,
+            )
             raise web.HTTPUnauthorized(text="Invalid API key")
 
         match = self.matchmaker.get_match(match_id)
@@ -84,6 +94,12 @@ class MatchHttpServer:
                 raise web.HTTPNotFound(text="Match not found")
             payload = json.loads(payload_json)
 
+        logger.info(
+            "Serving match JSON for %s (map=%s) to %s",
+            match_id,
+            payload.get("maplist", ["?"])[0] if payload.get("maplist") else "?",
+            request.remote,
+        )
         return web.Response(
             body=json.dumps(payload, indent=2),
             content_type="application/json",

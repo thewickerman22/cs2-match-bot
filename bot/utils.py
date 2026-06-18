@@ -56,11 +56,7 @@ def sanitize_console_command_for_log(command: str) -> str:
     """Redact secrets from server console commands before logging."""
     if "matchzy_loadmatch_url" not in command:
         return command
-    return re.sub(
-        r'(matchzy_loadmatch_url "[^"]+" "[^"]+" ")[^"]+(")',
-        r'\1***\2',
-        command,
-    )
+    return re.sub(r"(\?key=)[^\"&]+", r"\1***", command)
 
 
 def build_connect_command(host: str, port: int, password: str | None = None) -> str:
@@ -153,6 +149,7 @@ def build_server_connect_field(
     password: str | None = None,
     *,
     public_url: str | None = None,
+    alternate_host: str | None = None,
 ) -> str:
     if not is_valid_connect_host(host):
         return (
@@ -166,7 +163,7 @@ def build_server_connect_field(
         lines.extend(
             [
                 f"**[Launch CS2 and Join]({join_url})**",
-                "_Click the link — browser opens Steam and connects you to the server._",
+                "_From the CS2 main menu — open the link, or use the console command below._",
             ]
         )
     else:
@@ -174,4 +171,11 @@ def build_server_connect_field(
         lines.append(f"**[Launch CS2 and Join]({steam_url})**")
 
     lines.append(build_connect_info(host, port, password))
+    if alternate_host:
+        lines.append(
+            f"If that fails, try IP: `{build_connect_command(alternate_host, port, password)}`"
+        )
+    lines.append(
+        "_Tip: quit any offline/local game first. Timeout = server still loading or wrong port._"
+    )
     return "\n".join(lines)
