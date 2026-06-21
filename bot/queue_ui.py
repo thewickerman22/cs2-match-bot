@@ -141,7 +141,8 @@ def build_queue_embed(
             "3. React **✅** on this message when ready, or **❌** to unready\n"
             "4. **Premier map veto**: captains alternate **Ban Map** on Active Duty maps, then **Pick Side** (CT/T)\n"
             "5. For **2v2 / 5v5**, vote captains and **Pick Player**, then map veto + side pick\n\n"
-            "Voice channels during matches are split by **CT** and **T** based on the veto."
+            "During matches, roster are placed in **CT** / **T** voice once, then anyone "
+            "can use those channels and roster can join any other voice channel."
         ),
         color=discord.Color.blurple(),
     )

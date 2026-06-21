@@ -54,6 +54,13 @@ class MatchHttpServer:
         return web.json_response({"status": "ok"})
 
     async def join_server(self, request: web.Request) -> web.Response:
+        if not self.matchmaker.active_matches:
+            active_ids = await self.storage.get_active_match_ids()
+            if not active_ids:
+                raise web.HTTPForbidden(
+                    text="No active match — connect links are disabled until a match is loaded."
+                )
+
         host = request.query.get("host", "").strip()
         port_raw = request.query.get("port", "").strip()
         password = request.query.get("password", "").strip() or None

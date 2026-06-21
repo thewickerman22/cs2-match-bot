@@ -42,25 +42,14 @@ async def _resolve_member(guild: discord.Guild, discord_id: int) -> discord.Memb
         return None
 
 
-def match_roster_ids(match: ActiveMatch) -> set[int]:
-    return {player.discord_id for player in match.team1 + match.team2}
-
-
-def build_side_channel_overwrites(
+def build_match_channel_overwrites(
     guild: discord.Guild,
-    match: ActiveMatch,
-    side_channel_id: int,
-    ct_channel_id: int,
-    t_channel_id: int,
 ) -> dict[discord.Role | discord.Member | discord.Object, discord.PermissionOverwrite]:
-    """Only roster players assigned to this side may connect."""
-    overwrites: dict[
-        discord.Role | discord.Member | discord.Object,
-        discord.PermissionOverwrite,
-    ] = {
+    """Allow all server members to connect to match CT/T voice channels."""
+    return {
         guild.default_role: discord.PermissionOverwrite(
             view_channel=True,
-            connect=False,
+            connect=True,
         ),
         guild.me: discord.PermissionOverwrite(
             view_channel=True,
@@ -70,22 +59,6 @@ def build_side_channel_overwrites(
         ),
     }
 
-    for player in match.team1 + match.team2:
-        allowed_channel_id = player_side_channel_id(
-            match,
-            player.discord_id,
-            ct_channel_id,
-            t_channel_id,
-        )
-        if allowed_channel_id != side_channel_id:
-            continue
-        overwrites[discord.Object(id=player.discord_id)] = discord.PermissionOverwrite(
-            view_channel=True,
-            connect=True,
-        )
-
-    return overwrites
-
 
 async def apply_match_channel_permissions(
     guild: discord.Guild,
@@ -93,25 +66,14 @@ async def apply_match_channel_permissions(
     ct_channel: discord.VoiceChannel,
     t_channel: discord.VoiceChannel,
 ) -> None:
+    overwrites = build_match_channel_overwrites(guild)
     await ct_channel.edit(
-        overwrites=build_side_channel_overwrites(
-            guild,
-            match,
-            ct_channel.id,
-            ct_channel.id,
-            t_channel.id,
-        ),
-        reason="Restrict CT voice to match roster",
+        overwrites=overwrites,
+        reason="Open match voice channels",
     )
     await t_channel.edit(
-        overwrites=build_side_channel_overwrites(
-            guild,
-            match,
-            t_channel.id,
-            ct_channel.id,
-            t_channel.id,
-        ),
-        reason="Restrict T voice to match roster",
+        overwrites=overwrites,
+        reason="Open match voice channels",
     )
 
 
@@ -292,13 +254,13 @@ async def _move_member_to_channel(
         return False
 
 
-async def move_players_to_team_channels(
+async def move_roster_to_initial_team_channels(
     guild: discord.Guild,
     match: ActiveMatch,
     team1_channel_id: int,
     team2_channel_id: int,
 ) -> None:
-    """Move players to their assigned CT/T team channels."""
+    """One-time initial move: place roster in assigned CT/T channels when a match starts."""
     team1_channel = guild.get_channel(team1_channel_id)
     team2_channel = guild.get_channel(team2_channel_id)
     if not isinstance(team1_channel, discord.VoiceChannel):
@@ -308,12 +270,8 @@ async def move_players_to_team_channels(
 
     ct_channel_id = team1_channel_id
     t_channel_id = team2_channel_id
-    ct_channel = guild.get_channel(ct_channel_id)
-    t_channel = guild.get_channel(t_channel_id)
-    if not isinstance(ct_channel, discord.VoiceChannel):
-        return
-    if not isinstance(t_channel, discord.VoiceChannel):
-        return
+    ct_channel = team1_channel
+    t_channel = team2_channel
 
     for player in match.team1 + match.team2:
         member = await _resolve_member(guild, player.discord_id)
@@ -335,89 +293,25 @@ async def move_players_to_team_channels(
         await _move_member_to_channel(member, target_channel, team_label=side_label)
 
 
-async def enforce_match_voice_access(
-    guild: discord.Guild,
-    member: discord.Member,
-    match: ActiveMatch,
-    team1_channel_id: int,
-    team2_channel_id: int,
-) -> None:
-    """Keep match voice channels limited to the match roster on their assigned side."""
-    match_channel_ids = {team1_channel_id, team2_channel_id}
-    current_channel_id = (
-        member.voice.channel.id
-        if member.voice is not None and member.voice.channel is not None
-        else None
-    )
-    if current_channel_id not in match_channel_ids:
-        return
-
-    if member.id not in match_roster_ids(match):
-        try:
-            await member.move_to(None, reason="Not a player in this match")
-        except discord.HTTPException:
-            logger.warning(
-                "Could not remove %s (%s) from match voice channel %s",
-                member.display_name,
-                member.id,
-                current_channel_id,
-            )
-        return
-
-    expected_channel_id = team_channel_for_player(
-        match,
-        member.id,
-        team1_channel_id,
-        team2_channel_id,
-    )
-    if expected_channel_id is None or current_channel_id == expected_channel_id:
-        return
-
-    ct_channel = guild.get_channel(team1_channel_id)
-    t_channel = guild.get_channel(team2_channel_id)
-    if not isinstance(ct_channel, discord.VoiceChannel):
-        return
-    if not isinstance(t_channel, discord.VoiceChannel):
-        return
-
-    expected_channel = (
-        ct_channel if expected_channel_id == team1_channel_id else t_channel
-    )
-    side_label = "CT" if expected_channel_id == team1_channel_id else "T"
-    await _move_member_to_channel(member, expected_channel, team_label=side_label)
-
-
-async def enforce_player_team_voice(
-    guild: discord.Guild,
-    member: discord.Member,
-    match: ActiveMatch,
-    team1_channel_id: int,
-    team2_channel_id: int,
-) -> None:
-    await enforce_match_voice_access(
-        guild,
-        member,
-        match,
-        team1_channel_id,
-        team2_channel_id,
-    )
+# Backwards-compatible alias used by bot_app.
+move_players_to_team_channels = move_roster_to_initial_team_channels
 
 
 async def move_match_players_to_end_queue(
     guild: discord.Guild,
     roster_ids: set[int],
-    team1_channel_id: int,
-    team2_channel_id: int,
     end_queue_channel_id: int,
+    *,
+    team1_channel_id: int | None = None,
+    team2_channel_id: int | None = None,
 ) -> None:
-    """Move match roster players from team voice channels into End Queue."""
+    """Move match roster (and anyone left in team channels) into End Queue."""
     end_queue = await _resolve_voice_channel(guild, end_queue_channel_id)
     if end_queue is None:
         logger.warning("End Queue channel %s not found", end_queue_channel_id)
         return
 
-    team_channel_ids = {team1_channel_id, team2_channel_id}
-    moved = 0
+    moved_ids: set[int] = set()
 
     for discord_id in roster_ids:
         member = await _resolve_member(guild, discord_id)
@@ -425,14 +319,30 @@ async def move_match_players_to_end_queue(
             continue
         if member.voice is None or member.voice.channel is None:
             continue
-        if member.voice.channel.id not in team_channel_ids:
+        if member.voice.channel.id == end_queue_channel_id:
             continue
         if await _move_member_to_channel(member, end_queue, team_label="End Queue"):
-            moved += 1
+            moved_ids.add(member.id)
 
-    if moved:
+    team_channel_ids: set[int] = set()
+    for channel_id in (team1_channel_id, team2_channel_id):
+        if channel_id is None:
+            continue
+        team_channel_ids.add(channel_id)
+        channel = await _resolve_voice_channel(guild, channel_id)
+        if channel is None:
+            continue
+        for member in list(channel.members):
+            if member.bot or member.id in moved_ids:
+                continue
+            if member.voice is None or member.voice.channel is None:
+                continue
+            if await _move_member_to_channel(member, end_queue, team_label="End Queue"):
+                moved_ids.add(member.id)
+
+    if moved_ids:
         logger.info(
-            "Moved %s match player(s) to End Queue (%s)",
-            moved,
+            "Moved %s player(s) to End Queue (%s)",
+            len(moved_ids),
             end_queue_channel_id,
         )

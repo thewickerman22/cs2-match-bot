@@ -24,7 +24,6 @@ from elo_leaderboard import build_leaderboard_embed
 from match_voice import (
     create_match_voice_channels,
     delete_match_voice_channels_for_match,
-    enforce_player_team_voice,
     find_match_voice_channels_by_name,
     move_match_players_to_end_queue,
     move_players_to_team_channels,
@@ -175,6 +174,7 @@ class MatchBot(commands.Bot):
         await self.connect_resolver.refresh_dathost_connect_info(force=True)
         await self._register_live_match_report_views()
         await self._restart_active_match_polls(guild)
+        await self._sync_idle_server_lock()
 
     async def _register_live_match_report_views(self) -> None:
         for match_id in await self.storage.get_active_match_ids():
@@ -460,8 +460,6 @@ class MatchBot(commands.Bot):
             if self.settings.discord_guild_id != member.guild.id:
                 return
             setup = await self.ensure_guild_channels(member.guild)
-
-        await self._enforce_match_team_voice(member)
 
         before_mode = resolve_queue_mode(setup, before.channel)
         after_mode = resolve_queue_mode(setup, after.channel)
@@ -804,14 +802,7 @@ class MatchBot(commands.Bot):
                 if voice_member.bot:
                     continue
                 if await self._player_in_active_match(voice_member.id):
-                    await self._notify_queue_join_blocked(
-                        voice_member,
-                        "You still have an **active match** on record, so you were not "
-                        "added to the queue list. Ask an admin to react 🛑 on "
-                        f"**#{COMMANDS_CHANNEL_NAME}** after the game ends, or use "
-                        "**Report** buttons in `#match-results`.",
-                        key="active_match",
-                    )
+                    # Roster may use any voice channel during a match; do not queue them again.
                     continue
                 queued = self.matchmaker.is_queued(voice_member.id)
                 if queued is not None and queued[0] != mode:
@@ -1629,36 +1620,6 @@ class MatchBot(commands.Bot):
             self._match_voice_channels[match_id] = stored
         return stored
 
-    async def _find_match_for_voice_channel(
-        self,
-        channel_id: int,
-    ) -> tuple[ActiveMatch, int, int] | None:
-        for match in self.matchmaker.active_matches.values():
-            voice_ids = await self._get_match_voice_ids(match.match_id)
-            if voice_ids is None:
-                continue
-            team1_id, team2_id = voice_ids
-            if channel_id in {team1_id, team2_id}:
-                return match, team1_id, team2_id
-        return None
-
-    async def _enforce_match_team_voice(self, member: discord.Member) -> None:
-        if member.voice is None or member.voice.channel is None:
-            return
-
-        active = await self._find_match_for_voice_channel(member.voice.channel.id)
-        if active is None:
-            return
-
-        match, team1_id, team2_id = active
-        await enforce_player_team_voice(
-            member.guild,
-            member,
-            match,
-            team1_id,
-            team2_id,
-        )
-
     def _build_match_embed(
         self,
         match: ActiveMatch,
@@ -1671,9 +1632,11 @@ class MatchBot(commands.Bot):
         connect_ready = self.connect_resolver.is_connect_ready()
 
         description_lines = [
-            "You have been moved to your **team voice channel**. "
-            "Only players in this match can join CT/T voice. "
-            "Connect to the CS2 server — MatchZy assigns your in-game team from your linked Steam ID.",
+            "Roster players are moved once into their side's **CT** or **T** voice channel. "
+            "After that, roster and other members can join any voice channel in the server, "
+            "including the match **CT** / **T** channels. "
+            "Only **roster players** in this match can connect to the CS2 server. "
+            "MatchZy assigns your in-game team from your linked Steam ID.",
         ]
         if connect_ready:
             description_lines.append(
@@ -1700,17 +1663,18 @@ class MatchBot(commands.Bot):
             inline=True,
         )
         embed.add_field(name="Map", value=f"`{match.map_name}`", inline=True)
-        embed.add_field(
-            name="Join server",
-            value=build_server_connect_field(
-                public_host,
-                public_port,
-                server_password or None,
-                public_url=self.settings.public_url,
-                alternate_host=self.connect_resolver.get_connect_alternate_host(),
-            ),
-            inline=False,
-        )
+        if connect_ready:
+            embed.add_field(
+                name="Join server",
+                value=build_server_connect_field(
+                    public_host,
+                    public_port,
+                    server_password or None,
+                    public_url=self.settings.public_url,
+                    alternate_host=self.connect_resolver.get_connect_alternate_host(),
+                ),
+                inline=False,
+            )
         if team1_voice_id is not None and team2_voice_id is not None:
             embed.add_field(
                 name="Match voice",
@@ -1740,18 +1704,36 @@ class MatchBot(commands.Bot):
         )
 
     def _queue_should_show_server_connect(self, default_map: str) -> bool:
+        if not self.matchmaker.active_matches:
+            return False
+        return self.connect_resolver.is_connect_ready()
+
+    def _active_match_connect_field(self) -> str | None:
+        if not self.matchmaker.active_matches:
+            return None
+        if not self.connect_resolver.is_connect_ready():
+            return None
+        return self._server_connect_field()
+
+    async def _has_active_match(self) -> bool:
         if self.matchmaker.active_matches:
             return True
-        for mode in MatchMode:
-            if self.matchmaker.all_queued_players_ready(mode, default_map):
-                return True
-            captain_flow = self.matchmaker.get_captain_flow(mode, default_map)
-            if captain_flow.phase != CaptainPhase.NONE:
-                return True
-            map_flow = self.matchmaker.get_premier_veto_flow(mode, default_map)
-            if map_flow.phase != PremierVetoPhase.NONE:
-                return True
-        return False
+        return bool(await self.storage.get_active_match_ids())
+
+    async def _lock_idle_server(self) -> None:
+        try:
+            responses = await self.matchzy.lock_server_when_idle()
+            logger.info(
+                "Idle server lock applied (%s)",
+                "; ".join(responses) if responses else "no response",
+            )
+        except Exception:
+            logger.exception("Failed to lock CS2 server when idle")
+
+    async def _sync_idle_server_lock(self) -> None:
+        if await self._has_active_match():
+            return
+        await self._lock_idle_server()
 
     def _active_match_details_lines(self) -> list[str]:
         lines: list[str] = []
@@ -2086,18 +2068,16 @@ class MatchBot(commands.Bot):
 
         if move_to_end_queue:
             try:
-                if voice_ids is not None:
-                    roster_ids = await self._get_match_roster_ids(match_id)
-                    if roster_ids:
-                        end_queue_id = await self._ensure_end_queue_channel(guild)
-                        if end_queue_id is not None:
-                            await move_match_players_to_end_queue(
-                                guild,
-                                roster_ids,
-                                team1_id,
-                                team2_id,
-                                end_queue_id,
-                            )
+                roster_ids = await self._get_match_roster_ids(match_id)
+                end_queue_id = await self._ensure_end_queue_channel(guild)
+                if roster_ids and end_queue_id is not None:
+                    await move_match_players_to_end_queue(
+                        guild,
+                        roster_ids,
+                        end_queue_id,
+                        team1_channel_id=team1_id,
+                        team2_channel_id=team2_id,
+                    )
             except Exception:
                 logger.exception(
                     "Failed moving match %s players to End Queue; deleting team channels anyway",
@@ -2143,10 +2123,13 @@ class MatchBot(commands.Bot):
 
         if already_completed:
             self.matchmaker.finish_match(match_id)
+            await self._lock_idle_server()
             return
 
         await self.storage.update_match_status(match_id, "completed")
         self.matchmaker.finish_match(match_id)
+
+        await self._lock_idle_server()
 
         if cancelled:
             await self._finalize_cancelled_live_match(guild, match_id)
@@ -2292,7 +2275,7 @@ class MatchBot(commands.Bot):
             team1_names,
             team2_names,
             snapshot,
-            server_connect_field=self._server_connect_field(),
+            server_connect_field=self._active_match_connect_field(),
         )
         view = self._live_match_report_view(match.match_id)
         message = await results_channel.send(embed=embed, view=view)
@@ -2331,7 +2314,7 @@ class MatchBot(commands.Bot):
             team1_names,
             team2_names,
             snapshot,
-            server_connect_field=self._server_connect_field(),
+            server_connect_field=self._active_match_connect_field(),
         )
         view = self._live_match_report_view(match_id)
 
@@ -2633,7 +2616,7 @@ class MatchBot(commands.Bot):
                     team1_names,
                     team2_names,
                     snapshot,
-                    server_connect_field=self._server_connect_field(),
+                    server_connect_field=self._active_match_connect_field(),
                 )
                 view = self._live_match_report_view(match.match_id)
                 try:
@@ -2675,6 +2658,8 @@ class MatchBot(commands.Bot):
 
         self.matchmaker.restore_match_players_to_queue(match)
         await self.storage.update_match_status(match.match_id, "cancelled")
+
+        await self._lock_idle_server()
 
         setup = await self._get_guild_setup(guild)
         if setup is not None:

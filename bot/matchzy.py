@@ -110,6 +110,10 @@ def build_matchzy_config(match: ActiveMatch, settings: Settings) -> dict[str, An
 
         "matchzy_gg_enabled": "0",
 
+        # Allow joins while this match is loaded; bot re-enables idle lock after series end.
+
+        "matchzy_kick_when_no_match_loaded": "0",
+
     }
 
 
@@ -264,6 +268,30 @@ class MatchZyService:
 
         return responses
 
+    async def unlock_server_for_active_match(self) -> list[str]:
+        """Allow roster players to connect while a match JSON is loaded."""
+        responses: list[str] = []
+        for command in ("matchzy_kick_when_no_match_loaded 0",):
+            try:
+                responses.append(await self.console.execute(command))
+            except Exception:
+                logger.debug("Could not send MatchZy command: %s", command)
+        return responses
+
+    async def lock_server_when_idle(self) -> list[str]:
+        """Kick everyone and block joins when no match is loaded."""
+        responses: list[str] = []
+        for command in (
+            "css_endmatch",
+            "css_forceend",
+            "matchzy_kick_when_no_match_loaded 1",
+        ):
+            try:
+                responses.append(await self.console.execute(command))
+            except Exception:
+                logger.debug("Could not send MatchZy idle-lock command: %s", command)
+        return responses
+
 
 
     async def deploy_match(self, match: ActiveMatch) -> list[str]:
@@ -295,6 +323,8 @@ class MatchZyService:
         responses.append(await self.set_ready_required(match.mode.total_players))
 
         responses.extend(await self.disable_early_forfeit())
+
+        responses.extend(await self.unlock_server_for_active_match())
 
         return responses
 
