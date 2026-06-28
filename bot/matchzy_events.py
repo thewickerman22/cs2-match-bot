@@ -184,6 +184,14 @@ def build_series_end_payload_from_snapshot(
                 if resolved_winner is None:
                     resolved_winner = winner_from_round_scores(t1, t2)
 
+    if (
+        team1_series is None
+        and team2_series is None
+        and resolved_winner in {"team1", "team2"}
+    ):
+        team1_series = 1 if resolved_winner == "team1" else 0
+        team2_series = 0 if resolved_winner == "team1" else 1
+
     return build_series_end_payload(
         match_id,
         winner_team=resolved_winner,
@@ -280,6 +288,12 @@ def should_finish_match(
     """
     if is_forfeit_payload(payload):
         return False, "forfeit or disconnect-style payload"
+
+    if payload.get("source") == "player_report" and extract_winner_team(payload) in {
+        "team1",
+        "team2",
+    }:
+        return True, "roster majority player report"
 
     event_name = normalize_event_name(event_name)
 

@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import discord
+from typing import TYPE_CHECKING
 
 from config import MatchMode
 from guild_setup import (
@@ -38,7 +37,7 @@ def build_player_commands_embed() -> discord.Embed:
         title="How to play",
         description=(
             f"Join a **Queue » …** voice channel to enter the queue. "
-            f"Use **#{STATUS_CHANNEL_NAME}** for ready reactions and lobby buttons.\n\n"
+            f"Use **#{STATUS_CHANNEL_NAME}** for ready reactions and lobby picks.\n\n"
             f"Use the buttons below or on **#{STATUS_CHANNEL_NAME}** — no typing required."
         ),
         color=discord.Color.blurple(),
@@ -48,8 +47,7 @@ def build_player_commands_embed() -> discord.Embed:
             "**My Profile** — your linked Steam account and ELO\n"
             "**Leaderboard** — top players by mode (dropdown)\n"
             "**Link Steam Account** / **Unlink Steam** — manage your Steam link\n\n"
-            f"**#{STATUS_CHANNEL_NAME}** buttons: Ban Map, Pick Side, Vote Captains, Pick Player\n"
-            f"**#{STATUS_CHANNEL_NAME}** reactions: ✅ ready · ❌ unready\n"
+            f"**#{STATUS_CHANNEL_NAME}** reactions: ✅ ready · ❌ unready · lobby picks use numbered/letter reactions on the status message\n"
             f"**#{RESULTS_CHANNEL_NAME}** — report winner or **End Match (No ELO)** if stuck\n"
             f"**#{ELO_CHANNEL_NAME}** — live leaderboard (updates after each match)"
         ),

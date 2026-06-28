@@ -7,16 +7,30 @@ import discord
 from captain_flow import CaptainFlowState, CaptainPhase, CaptainTeam
 from config import MatchMode
 from guild_setup import VOICE_CHANNEL_NAMES
+from lobby_reactions import (
+    READY_EMOJI,
+    UNREADY_EMOJI,
+    SIDE_CT_EMOJI,
+    SIDE_T_EMOJI,
+    embed_heading,
+    embed_item,
+    format_lobby_players_block,
+)
 from maps import map_display_name
-from premier_veto_flow import PremierVetoPhase
 from matchmaker import Matchmaker
+from premier_veto_flow import PremierVetoPhase
+
+QUEUE_STATUS_EMBED_TITLE = "CS2 Matchmaking Queue"
+EMBED_FIELD_LIMIT = 1024
+
+
+def _clamp_embed_text(text: str, limit: int = EMBED_FIELD_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
 
 if TYPE_CHECKING:
     from bot_app import MatchBot
-
-
-READY_EMOJI = "✅"
-UNREADY_EMOJI = "❌"
 
 
 def _ready_icon(ready: bool) -> str:
@@ -25,9 +39,9 @@ def _ready_icon(ready: bool) -> str:
 
 def _format_team_line(label: str, player_ids: list[int]) -> str:
     if not player_ids:
-        return f"**{label}:** _empty_"
-    members = " · ".join(f"<@{player_id}>" for player_id in player_ids)
-    return f"**{label}:** {members}"
+        return f"{embed_heading(label)}\n_empty_"
+    members = "\n".join(embed_item(f"<@{player_id}>") for player_id in player_ids)
+    return f"{embed_heading(label)}\n{members}"
 
 
 def _pending_voter_mentions(lobby_ids: list[int], voted_ids: set[int]) -> str:
@@ -35,6 +49,71 @@ def _pending_voter_mentions(lobby_ids: list[int], voted_ids: set[int]) -> str:
     if not pending:
         return "_everyone voted_"
     return ", ".join(pending)
+
+
+def _mode_has_lobby_activity(
+    matchmaker: Matchmaker,
+    mode: MatchMode,
+    default_map: str,
+) -> bool:
+    flow = matchmaker.get_captain_flow(mode, default_map)
+    veto_flow = matchmaker.get_premier_veto_flow(mode, default_map)
+    return flow.phase != CaptainPhase.NONE or veto_flow.phase != PremierVetoPhase.NONE
+
+
+def _mode_lobby_status_block(
+    matchmaker: Matchmaker,
+    mode: MatchMode,
+    default_map: str,
+) -> str | None:
+    flow = matchmaker.get_captain_flow(mode, default_map)
+    veto_flow = matchmaker.get_premier_veto_flow(mode, default_map)
+    ready_count = sum(
+        1 for entry in matchmaker.get_mode_entries(mode, default_map) if entry.ready
+    )
+
+    if not _mode_has_lobby_activity(matchmaker, mode, default_map):
+        return None
+
+    lines = [embed_heading(f"{mode.label} on `{default_map}`", level=1)]
+
+    if flow.phase != CaptainPhase.NONE:
+        if flow.phase == CaptainPhase.DRAFTING and flow.team_alpha_captain_id is not None:
+            lines.append(embed_heading("Captains"))
+            lines.append(embed_item(f"Alpha <@{flow.team_alpha_captain_id}>"))
+            lines.append(embed_item(f"Bravo <@{flow.team_bravo_captain_id}>"))
+        flow_line = _captain_flow_line(flow, mode, ready_count)
+        if flow_line:
+            lines.append(flow_line)
+
+    if veto_flow.phase != PremierVetoPhase.NONE:
+        if veto_flow.alpha_captain_id is not None:
+            lines.append(embed_heading("Captains"))
+            lines.append(embed_item(f"Alpha <@{veto_flow.alpha_captain_id}>"))
+            lines.append(embed_item(f"Bravo <@{veto_flow.bravo_captain_id}>"))
+        veto_line = _premier_veto_flow_line(veto_flow, mode, ready_count)
+        if veto_line:
+            lines.append(veto_line)
+
+    players_block = format_lobby_players_block(matchmaker, mode, default_map)
+    if players_block:
+        lines.append(players_block)
+
+    return "\n".join(lines)
+
+
+def build_consolidated_lobby_status(
+    matchmaker: Matchmaker,
+    default_map: str,
+) -> str | None:
+    blocks = [
+        block
+        for mode in MatchMode
+        if (block := _mode_lobby_status_block(matchmaker, mode, default_map)) is not None
+    ]
+    if not blocks:
+        return None
+    return "\n\n".join(blocks)
 
 
 def _captain_flow_line(
@@ -47,10 +126,11 @@ def _captain_flow_line(
         alpha_voters = set(flow.alpha_votes.keys())
         bravo_voters = set(flow.bravo_votes.keys())
         lines = [
-            f"🗳️ **Captain vote** ({alpha_done}/{total} Alpha · {bravo_done}/{total} Bravo)",
+            embed_heading("Captain vote", level=1),
+            f"_{alpha_done}/{total} Alpha · {bravo_done}/{total} Bravo voted_",
             f"Still need Alpha vote: {_pending_voter_mentions(flow.lobby_ids, alpha_voters)}",
             f"Still need Bravo vote: {_pending_voter_mentions(flow.lobby_ids, bravo_voters)}",
-            "Lobby players: use **Vote Captains** in this channel.",
+            "React **1️⃣–🔟** for Team Alpha captain and **Ⓐ–Ⓙ** for Team Bravo captain on this message.",
         ]
         if flow.team_alpha_captain_id is None and alpha_done == total and bravo_done == total:
             lines.append("_Tallying captains…_")
@@ -61,17 +141,18 @@ def _captain_flow_line(
         picker = flow.current_picker_id()
         picker_text = f"<@{picker}>" if picker is not None else "_unknown_"
         lines = [
-            f"🎯 **Player draft** — {picker_text} ({next_team}) picks next.",
+            embed_heading("Player draft", level=1),
+            embed_item(f"{picker_text} ({next_team}) picks next"),
             _format_team_line("Team Alpha", flow.team_alpha_ids),
             _format_team_line("Team Bravo", flow.team_bravo_ids),
-            f"Available: {', '.join(f'<@{player_id}>' for player_id in flow.available_pick_ids) or '_none_'}",
+            "React with **1️⃣–🔟** on this message to draft (see player list below).",
         ]
         return "\n".join(lines)
 
     if ready_count >= mode.total_players:
         return (
             "⚠️ Enough players ready — captain voting will start automatically. "
-            "Use **Vote Captains** once the lobby opens."
+            "React on this message once captain voting opens."
         )
 
     return ""
@@ -87,18 +168,22 @@ def _premier_veto_flow_line(
         captain_id = flow.captain_for_team(flow.ban_turn_team())
         captain_text = f"<@{captain_id}>" if captain_id is not None else "_unknown_"
         ban_lines = [
-            f"- {flow.team_label(team)} banned **{map_display_name(map_id)}**"
+            f"{flow.team_label(team)} banned **{map_display_name(map_id)}**"
             for team, map_id in flow.bans
         ]
-        remaining = ", ".join(map_display_name(map_id) for map_id in sorted(flow.remaining_maps))
         bans_left = flow.bans_remaining()
         lines = [
-            f"🗺️ **Premier map veto** — {captain_text} ({turn_team}) bans next",
-            f"Bans left: **{bans_left}** · Remaining maps: {remaining or '_none_'}",
+            embed_heading("Premier map veto", level=1),
+            embed_item(f"{captain_text} ({turn_team}) bans next"),
+            f"Bans left: **{bans_left}**",
         ]
         if ban_lines:
-            lines.append("\n".join(ban_lines))
-        lines.append("Captains: use **Ban Map** in this channel.")
+            lines.append(embed_heading("Banned maps"))
+            lines.extend(embed_item(line) for line in ban_lines)
+        lines.append(
+            f"**{turn_team}** captain: react that map's fixed number below "
+            "(numbers stay the same; banned maps lose their reaction)."
+        )
         return "\n".join(lines)
 
     if flow.phase == PremierVetoPhase.SIDE_PICK:
@@ -107,15 +192,16 @@ def _premier_veto_flow_line(
         captain_text = f"<@{captain_id}>" if captain_id is not None else "_unknown_"
         chosen = map_display_name(flow.chosen_map or "")
         return (
-            f"🎯 **Side pick** on **{chosen}** (`{flow.chosen_map}`)\n"
-            f"{captain_text} ({flow.team_label(picker)}) picks **CT** or **T** with **Pick Side**."
+            f"{embed_heading('Side pick', level=1)}\n"
+            f"{embed_item(f'**{chosen}** (`{flow.chosen_map}`)')}\n"
+            f"{embed_item(f'{captain_text} ({flow.team_label(picker)}) — {SIDE_CT_EMOJI} CT or {SIDE_T_EMOJI} T')}"
         )
 
     if ready_count >= mode.total_players:
         if mode == MatchMode.ONE_V_ONE:
             return (
                 "⚠️ Enough players ready — **Premier map veto** will start automatically. "
-                "Captains use **Ban Map**, then **Pick Side**."
+                "Use numbered reactions, then **🛡️ CT** / **⚔️ T** for side pick."
             )
         return (
             "⚠️ Enough players ready — after captain draft, **Premier map veto** begins."
@@ -133,19 +219,34 @@ def build_queue_embed(
     ready_countdown_lines: dict[MatchMode, str] | None = None,
     lobby_activity_lines: dict[MatchMode, str] | None = None,
 ) -> discord.Embed:
+    lobby_status = build_consolidated_lobby_status(matchmaker, default_map)
+    embed_color = (
+        discord.Color.gold() if lobby_status is not None else discord.Color.blurple()
+    )
+
     embed = discord.Embed(
-        title="CS2 Matchmaking Queue",
+        title=QUEUE_STATUS_EMBED_TITLE,
         description=(
             "1. Click **Link Steam Account** on this channel or **#queue-status**; use **Unlink Steam** to remove a link\n"
             "2. Join a **Queue** voice channel below (leave the channel to leave the queue)\n"
             "3. React **✅** on this message when ready, or **❌** to unready\n"
-            "4. **Premier map veto**: captains alternate **Ban Map** on Active Duty maps, then **Pick Side** (CT/T)\n"
-            "5. For **2v2 / 5v5**, vote captains and **Pick Player**, then map veto + side pick\n\n"
+            "4. **Captain vote / draft / map veto / side pick** — use the reactions on this message "
+            "(numbers, Ⓐ–Ⓙ, 🛡️ CT, ⚔️ T)\n"
+            "5. For **2v2 / 5v5**, vote captains and draft players, then map veto + side pick\n\n"
+            "All lobby updates appear in **Lobby status** below, including every player in queue. "
+            "React on this message when it is your turn.\n\n"
             "During matches, roster are placed in **CT** / **T** voice once, then anyone "
             "can use those channels and roster can join any other voice channel."
         ),
-        color=discord.Color.blurple(),
+        color=embed_color,
     )
+
+    if lobby_status is not None:
+        embed.add_field(
+            name="Lobby status",
+            value=_clamp_embed_text(lobby_status),
+            inline=False,
+        )
 
     for mode in MatchMode:
         entries = matchmaker.get_mode_entries(mode, default_map)
@@ -186,11 +287,15 @@ def build_queue_embed(
         else:
             players_text = "_No players in queue_"
 
-        field_lines = [
-            f"Voice: **{voice_name}**",
-            players_text,
-        ]
-        if matchmaker.captains_required(mode):
+        field_lines = [f"Voice: **{voice_name}**"]
+        show_flow_in_field = lobby_status is None
+        if lobby_status is not None and _mode_has_lobby_activity(matchmaker, mode, default_map):
+            field_lines.append(
+                f"_{ready_count}/{mode.total_players} ready — see **Lobby status** above for all players_"
+            )
+        else:
+            field_lines.append(players_text if entries else "_No players in queue_")
+        if show_flow_in_field and matchmaker.captains_required(mode):
             flow_line = _captain_flow_line(
                 matchmaker.get_captain_flow(mode, default_map),
                 mode,
@@ -198,13 +303,14 @@ def build_queue_embed(
             )
             if flow_line:
                 field_lines.append(flow_line)
-        veto_line = _premier_veto_flow_line(
-            matchmaker.get_premier_veto_flow(mode, default_map),
-            mode,
-            ready_count,
-        )
-        if veto_line:
-            field_lines.append(veto_line)
+        if show_flow_in_field:
+            veto_line = _premier_veto_flow_line(
+                matchmaker.get_premier_veto_flow(mode, default_map),
+                mode,
+                ready_count,
+            )
+            if veto_line:
+                field_lines.append(veto_line)
 
         countdown = (ready_countdown_lines or {}).get(mode)
         if countdown:
@@ -216,21 +322,21 @@ def build_queue_embed(
 
         embed.add_field(
             name=f"{mode.label} ({ready_count}/{mode.total_players} ready)",
-            value="\n".join(field_lines),
+            value=_clamp_embed_text("\n".join(field_lines)),
             inline=False,
         )
 
     if active_match_lines:
         embed.add_field(
             name="Active match",
-            value="\n".join(active_match_lines),
+            value=_clamp_embed_text("\n".join(active_match_lines)),
             inline=False,
         )
 
     if server_connect_field:
         embed.add_field(
             name="Join game server",
-            value=server_connect_field,
+            value=_clamp_embed_text(server_connect_field),
             inline=False,
         )
 
@@ -355,6 +461,8 @@ class PremierBanSelect(discord.ui.Select):
         mode: MatchMode,
         map_name: str,
         remaining_maps: list[str],
+        *,
+        placeholder: str = "Ban a map",
     ) -> None:
         options = [
             discord.SelectOption(
@@ -364,10 +472,11 @@ class PremierBanSelect(discord.ui.Select):
             for map_id in remaining_maps[:25]
         ]
         super().__init__(
-            placeholder="Ban a map",
+            placeholder=placeholder[:100],
             min_values=1,
             max_values=1,
             options=options,
+            row=1,
         )
         self.bot = bot
         self.mode = mode
@@ -382,16 +491,12 @@ class PremierBanSelect(discord.ui.Select):
         )
 
 
-class PremierBanSelectView(discord.ui.View):
-    def __init__(
-        self,
-        bot: MatchBot,
-        mode: MatchMode,
-        map_name: str,
-        remaining_maps: list[str],
-    ) -> None:
-        super().__init__(timeout=120)
-        self.add_item(PremierBanSelect(bot, mode, map_name, remaining_maps))
+def build_queue_status_view(
+    bot: MatchBot,
+    matchmaker: Matchmaker,
+    default_map: str,
+) -> discord.ui.View:
+    return QueueControlView(bot)
 
 
 class SidePickView(discord.ui.View):
@@ -458,51 +563,3 @@ class QueueControlView(discord.ui.View):
         button: discord.ui.Button,
     ) -> None:
         await self.bot.handle_steam_unlink_request(interaction)
-
-    @discord.ui.button(
-        label="Ban Map",
-        style=discord.ButtonStyle.primary,
-        custom_id="cs2match:mapvote",
-    )
-    async def premier_ban_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        await self.bot.handle_open_premier_ban(interaction)
-
-    @discord.ui.button(
-        label="Pick Side",
-        style=discord.ButtonStyle.success,
-        custom_id="cs2match:picksides",
-    )
-    async def pick_side_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        await self.bot.handle_open_side_pick(interaction)
-
-    @discord.ui.button(
-        label="Vote Captains",
-        style=discord.ButtonStyle.primary,
-        custom_id="cs2match:vote",
-    )
-    async def vote_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        await self.bot.handle_open_captain_vote(interaction)
-
-    @discord.ui.button(
-        label="Pick Player",
-        style=discord.ButtonStyle.primary,
-        custom_id="cs2match:pick",
-    )
-    async def pick_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        await self.bot.handle_open_draft_pick(interaction)

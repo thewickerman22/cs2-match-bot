@@ -3,7 +3,11 @@ from __future__ import annotations
 import html
 import json
 import re
+from typing import TYPE_CHECKING
 from urllib.parse import quote, urlencode
+
+if TYPE_CHECKING:
+    from matchzy import ActiveMatch, QueuedPlayer
 
 STEAM64_PATTERN = re.compile(r"^\d{17}$")
 STEAM_LEGACY_PATTERN = re.compile(r"^STEAM_[0-5]:([0-1]):(\d+)$", re.IGNORECASE)
@@ -143,6 +147,85 @@ def build_join_redirect_html(host: str, port: int, password: str | None = None) 
 </html>"""
 
 
+def resolve_join_url(
+    host: str,
+    port: int,
+    password: str | None,
+    *,
+    public_url: str | None,
+) -> str:
+    if public_url:
+        return build_join_page_url(public_url, host, port, password)
+    return build_steam_connect_url(host, port, password)
+
+
+def _on_team1(match: ActiveMatch, discord_id: int) -> bool:
+    return any(player.discord_id == discord_id for player in match.team1)
+
+
+def _on_team2(match: ActiveMatch, discord_id: int) -> bool:
+    return any(player.discord_id == discord_id for player in match.team2)
+
+
+def _team_side_label(match: ActiveMatch, *, on_team1: bool) -> str:
+    team1_is_ct = match.team1_side == "ct"
+    if on_team1:
+        return "CT" if team1_is_ct else "T"
+    return "T" if team1_is_ct else "CT"
+
+
+def player_assignment_label(match: ActiveMatch, discord_id: int) -> str | None:
+    """Human-readable assignment, e.g. ``Team Alpha (CT)``."""
+    if _on_team1(match, discord_id):
+        team_name = "Team Alpha"
+        side = _team_side_label(match, on_team1=True)
+    elif _on_team2(match, discord_id):
+        team_name = "Team Bravo"
+        side = _team_side_label(match, on_team1=False)
+    else:
+        return None
+    return f"{team_name} (**{side}**)"
+
+
+def format_match_team_roster(
+    match: ActiveMatch,
+    players: list[QueuedPlayer],
+    team_label: str,
+    *,
+    on_team1: bool,
+    join_url: str | None = None,
+) -> str:
+    side = _team_side_label(match, on_team1=on_team1)
+    lines = [f"## {side} · {team_label}"]
+    if join_url:
+        lines.append(f"# [Join — {side} side]({join_url})")
+    for player in players:
+        lines.append(f"• <@{player.discord_id}> · `{player.steam_id}` → **{side}**")
+    return "\n".join(lines)
+
+
+def build_match_connect_blocks(match: ActiveMatch, join_url: str) -> list[str]:
+    """Prominent per-team join links for queue-status / match embeds."""
+    return [
+        f"# [Launch CS2 and connect]({join_url})",
+        "_MatchZy assigns **CT** or **T** from your linked Steam ID when you connect._",
+        format_match_team_roster(
+            match,
+            match.team1,
+            "Team Alpha",
+            on_team1=True,
+            join_url=join_url,
+        ),
+        format_match_team_roster(
+            match,
+            match.team2,
+            "Team Bravo",
+            on_team1=False,
+            join_url=join_url,
+        ),
+    ]
+
+
 def build_server_connect_field(
     host: str,
     port: int,
@@ -150,6 +233,7 @@ def build_server_connect_field(
     *,
     public_url: str | None = None,
     alternate_host: str | None = None,
+    match: ActiveMatch | None = None,
 ) -> str:
     if not is_valid_connect_host(host):
         return (
@@ -157,23 +241,27 @@ def build_server_connect_field(
             "**#bot-commands**, or set `CS2_PUBLIC_HOST` and `CS2_PUBLIC_PORT` in the bot `.env`."
         )
 
+    join_url = resolve_join_url(host, port, password, public_url=public_url)
     lines: list[str] = []
-    if public_url:
-        join_url = build_join_page_url(public_url, host, port, password)
+
+    if match is not None:
+        lines.extend(build_match_connect_blocks(match, join_url))
+    else:
         lines.extend(
             [
-                f"**[Launch CS2 and Join]({join_url})**",
-                "_From the CS2 main menu — open the link, or use the console command below._",
+                f"# [Launch CS2 and connect]({join_url})",
+                "_Opens CS2 and connects to the server._",
             ]
         )
-    else:
-        steam_url = build_steam_connect_url(host, port, password)
-        lines.append(f"**[Launch CS2 and Join]({steam_url})**")
 
-    lines.append(build_connect_info(host, port, password))
+    lines.append(
+        f"Console fallback: `{build_connect_command(host, port, password)}`"
+    )
     if alternate_host:
+        alt_url = resolve_join_url(alternate_host, port, password, public_url=public_url)
+        lines.append(f"# [Connect via IP]({alt_url})")
         lines.append(
-            f"If that fails, try IP: `{build_connect_command(alternate_host, port, password)}`"
+            f"IP console: `{build_connect_command(alternate_host, port, password)}`"
         )
     lines.append(
         "_Tip: quit any offline/local game first. Timeout = server still loading or wrong port._"

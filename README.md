@@ -158,7 +158,7 @@ Use the pinned panel in **#bot-commands** (or duplicate buttons on **#queue-stat
 | **✅ / ❌** | `#queue-status` | Ready / unready |
 | **1️⃣–🔟 / Ⓐ–Ⓙ** | `#queue-status` | Captain vote — number = Team Alpha pick, letter = Team Bravo pick (2v2/5v5) |
 | **1️⃣–🔟** | `#queue-status` | Captain draft pick — react the number next to an available player |
-| **1️⃣–7️⃣** | `#queue-status` | Premier map veto — ban the map with that number (captain only) |
+| **1️⃣–9️⃣** | `#queue-status` | Premier map veto — each map has a fixed number (see Lobby status) |
 | **🛡️ / ⚔️** | `#queue-status` | Side pick — CT or T after veto (captain only) |
 | **Report: Team Alpha/Bravo Won** | `#match-results` | Majority roster vote if webhooks fail |
 | **End Match (No ELO)** | `#match-results` | Majority roster vote — cleanup only, no ELO |
@@ -191,7 +191,7 @@ Set `DISCORD_ADMIN_ROLE_ID` in `.env` to grant the admin role without Discord se
 | 4 | Once the queue is **full**, everyone must ready within **5 minutes** (default) or the queue is cancelled |
 | 5 | For **2v2 / 5v5**, lobby players react **1️⃣–🔟** (Alpha captain) and **Ⓐ–Ⓙ** (Bravo captain) on the pinned message |
 | 6 | Captains alternate draft picks — react **1️⃣–🔟** next to the player you want |
-| 7 | **Premier map veto** — the banning captain reacts **1️⃣–7️⃣** on the listed map |
+| 7 | **Premier map veto** — the banning captain reacts that map's fixed number |
 | 8 | The side-picking captain reacts **🛡️** (CT) or **⚔️** (T); the match deploys to the server |
 
 Leave a queue voice channel to leave the queue.
@@ -207,7 +207,7 @@ The **Lobby status** field lists every player in queue (ready state, team, vote 
 | Ready | ✅ ready · ❌ unready |
 | Captain vote (2v2/5v5) | **1️⃣–🔟** = Alpha captain · **Ⓐ–Ⓙ** = Bravo captain |
 | Player draft | **1️⃣–🔟** = pick available player (captain only) |
-| Map veto | **1️⃣–7️⃣** = ban map (listed in Lobby status) |
+| Map veto | **1️⃣–9️⃣** = ban map (fixed number per map in Lobby status) |
 | Side pick | **🛡️** CT · **⚔️** T |
 
 On **5v5 captain vote**, Discord allows at most 20 reactions on one message, so ✅/❌ ready toggles are temporarily removed until voting finishes. Players are already ready when the lobby opens.
@@ -222,17 +222,19 @@ When the match ends (MatchZy webhook, player report, or admin 🛑), players mov
 
 ## Supported maps
 
-Voice queues use `DEFAULT_MAP` from `.env` (default **Dust II** / `de_dust2`). **Premier map veto** uses the **Active Duty** pool only (7 maps).
+Voice queues use `DEFAULT_MAP` from `.env` (default **Dust II** / `de_dust2`). **Premier map veto** uses Active Duty plus **Train** and **Cache** (9 maps).
 
-| Map | ID |
-|---|---|
-| Ancient | `de_ancient` |
-| Anubis | `de_anubis` |
-| Dust II | `de_dust2` |
-| Inferno | `de_inferno` |
-| Mirage | `de_mirage` |
-| Nuke | `de_nuke` |
-| Overpass | `de_overpass` |
+| Map | ID | Ban reaction |
+|---|---|---|
+| Ancient | `de_ancient` | 1️⃣ |
+| Anubis | `de_anubis` | 2️⃣ |
+| Dust II | `de_dust2` | 3️⃣ |
+| Inferno | `de_inferno` | 4️⃣ |
+| Mirage | `de_mirage` | 5️⃣ |
+| Nuke | `de_nuke` | 6️⃣ |
+| Overpass | `de_overpass` | 7️⃣ |
+| Train | `de_train` | 8️⃣ |
+| Cache | `de_cache` | 9️⃣ |
 
 The canonical list lives in `bot/maps.py` (`CS2_MAPS`, `PREMIER_VETO_POOL`, `MAP_ALIASES`).
 

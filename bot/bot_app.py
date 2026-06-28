@@ -34,7 +34,6 @@ from matchzy_events import (
     build_series_end_payload_from_snapshot,
     finish_payload_summary,
     parse_event_payload,
-    rounds_to_win,
     should_finish_match,
     snapshot_has_completed_map,
 )
@@ -51,17 +50,32 @@ from matchzy import ActiveMatch, MatchZyService, serialize_match_config
 from queue_ui import (
     CaptainPickSelectView,
     CaptainVoteSelectView,
-    PremierBanSelectView,
     SidePickView,
     QueueControlView,
+    QUEUE_STATUS_EMBED_TITLE,
+    build_queue_embed,
+    build_queue_status_view,
+)
+from lobby_reactions import (
+    LobbyReactionKind,
     READY_EMOJI,
     UNREADY_EMOJI,
-    build_queue_embed,
+    alpha_vote_emojis,
+    bravo_vote_emojis,
+    build_lobby_reaction_plan,
+    resolve_lobby_reaction,
 )
 from steam_link_ui import SteamLinkDmView, SteamLinkModal, SteamUnlinkConfirmView
 from server_connect import ServerConnectResolver
 from storage import Storage
-from utils import build_connect_info, build_server_connect_field, format_team, normalize_steam_id
+from utils import (
+    build_connect_info,
+    build_server_connect_field,
+    format_match_team_roster,
+    normalize_steam_id,
+    player_assignment_label,
+    resolve_join_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +126,6 @@ class MatchBot(commands.Bot):
         self.guild_setups: dict[int, GuildSetup] = {}
         self._reaction_sync_user_ids: set[int] = set()
         self._queue_ready_timer_tasks: dict[tuple[MatchMode, str], asyncio.Task] = {}
-        self._match_status_messages: dict[str, int] = {}
         self._match_voice_channels: dict[str, tuple[int, int]] = {}
         self._match_finish_fallback_tasks: dict[str, asyncio.Task] = {}
         self._live_match_snapshots: dict[str, LiveMatchSnapshot] = {}
@@ -362,14 +375,6 @@ class MatchBot(commands.Bot):
 
         mode = await self._get_match_mode(match_id)
         snapshot = self._live_match_snapshots.get(match_id)
-        if not snapshot_has_completed_map(snapshot, mode):
-            await interaction.followup.send(
-                "This match is still in progress — reports are only accepted after a "
-                f"completed map (at least **{rounds_to_win(mode)}** rounds).",
-                ephemeral=True,
-            )
-            return
-
         payload = build_series_end_payload_from_snapshot(
             match_id,
             winner_team,
@@ -377,6 +382,14 @@ class MatchBot(commands.Bot):
             mode=mode,
             source="player_report",
         )
+        allowed, reason = should_finish_match(payload, "series_end", mode)
+        if not allowed:
+            await interaction.followup.send(
+                f"Could not finish the match: {reason}.",
+                ephemeral=True,
+            )
+            return
+
         await self._finish_match_from_event(interaction.guild, match_id, payload)
         await interaction.followup.send("Match result confirmed — finishing match.", ephemeral=True)
 
@@ -521,6 +534,170 @@ class MatchBot(commands.Bot):
         await self.refresh_elo_leaderboard(guild, season=season)
         return setup
 
+    async def _find_all_queue_status_messages(
+        self,
+        channel: discord.TextChannel,
+    ) -> list[discord.Message]:
+        if self.user is None:
+            return []
+
+        found: list[discord.Message] = []
+        async for message in channel.history(limit=50):
+            if message.author.id != self.user.id:
+                continue
+            if not message.embeds:
+                continue
+            if message.embeds[0].title == QUEUE_STATUS_EMBED_TITLE:
+                found.append(message)
+        return found
+
+    async def _delete_queue_status_message(self, message: discord.Message) -> None:
+        try:
+            await message.delete()
+        except discord.NotFound:
+            pass
+        except discord.HTTPException:
+            logger.warning("Could not delete queue status message %s", message.id)
+
+    async def _cleanup_stale_lobby_notice_messages(
+        self,
+        channel: discord.TextChannel,
+    ) -> None:
+        """Delete leftover text announcements from older bot versions."""
+        if self.user is None:
+            return
+
+        stale_markers = (
+            "Premier map veto started",
+            "Premier map veto will begin",
+            "Premier veto complete",
+            "Draft complete for **",
+            "Captain voting finished for **",
+            "click **Ban Map**",
+            "click **Pick Player**",
+            "captain bans next",
+        )
+        async for message in channel.history(limit=40):
+            if message.author.id != self.user.id:
+                continue
+            if message.embeds:
+                continue
+            content = message.content or ""
+            if not content:
+                continue
+            if any(marker in content for marker in stale_markers):
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    logger.debug(
+                        "Could not delete stale lobby notice message %s",
+                        message.id,
+                    )
+
+    async def _try_edit_queue_status_message(
+        self,
+        message: discord.Message,
+        embed: discord.Embed,
+        view: discord.ui.View,
+    ) -> bool:
+        for kwargs in ({"embed": embed, "view": view}, {"embed": embed}):
+            try:
+                await message.edit(**kwargs)
+                await self._ensure_queue_reactions(message)
+                return True
+            except discord.NotFound:
+                return False
+            except discord.HTTPException as exc:
+                logger.debug(
+                    "Queue status edit failed for message %s (%s): %s",
+                    message.id,
+                    ",".join(kwargs.keys()),
+                    exc,
+                )
+        return False
+
+    async def _save_status_message_id(
+        self,
+        guild: discord.Guild,
+        setup: GuildSetup,
+        message_id: int,
+    ) -> None:
+        if setup.status_message_id == message_id:
+            return
+        setup = GuildSetup(
+            guild_id=setup.guild_id,
+            category_id=setup.category_id,
+            status_channel_id=setup.status_channel_id,
+            status_message_id=message_id,
+            results_channel_id=setup.results_channel_id,
+            elo_channel_id=setup.elo_channel_id,
+            elo_message_id=setup.elo_message_id,
+            voice_channels=setup.voice_channels,
+            end_queue_channel_id=setup.end_queue_channel_id,
+            commands_channel_id=setup.commands_channel_id,
+            commands_player_message_id=setup.commands_player_message_id,
+            commands_admin_message_id=setup.commands_admin_message_id,
+        )
+        self.guild_setups[guild.id] = setup
+        await self.storage.save_guild_setup(setup)
+
+    async def _upsert_queue_status_message(
+        self,
+        guild: discord.Guild,
+        setup: GuildSetup,
+        channel: discord.TextChannel,
+    ) -> discord.Message | None:
+        embed = self._build_queue_status_embed()
+        view = build_queue_status_view(
+            self,
+            self.matchmaker,
+            self.settings.default_map,
+        )
+
+        await self._cleanup_stale_lobby_notice_messages(channel)
+
+        candidates: list[discord.Message] = []
+        seen_ids: set[int] = set()
+        if setup.status_message_id is not None:
+            try:
+                message = await channel.fetch_message(setup.status_message_id)
+                candidates.append(message)
+                seen_ids.add(message.id)
+            except discord.NotFound:
+                pass
+
+        for message in await self._find_all_queue_status_messages(channel):
+            if message.id not in seen_ids:
+                candidates.append(message)
+                seen_ids.add(message.id)
+
+        for message in candidates:
+            if await self._try_edit_queue_status_message(message, embed, view):
+                await self._save_status_message_id(guild, setup, message.id)
+                for duplicate in candidates:
+                    if duplicate.id != message.id:
+                        await self._delete_queue_status_message(duplicate)
+                for duplicate in await self._find_all_queue_status_messages(channel):
+                    if duplicate.id != message.id:
+                        await self._delete_queue_status_message(duplicate)
+                try:
+                    await message.pin()
+                except discord.HTTPException:
+                    pass
+                return message
+
+        for message in await self._find_all_queue_status_messages(channel):
+            await self._delete_queue_status_message(message)
+
+        message = await channel.send(embed=embed, view=view)
+        await self._ensure_queue_reactions(message)
+        try:
+            await message.pin()
+        except discord.HTTPException:
+            logger.warning("Could not pin queue status message in #%s", channel.name)
+        await self._save_status_message_id(guild, setup, message.id)
+        return message
+
     async def ensure_status_message(
         self,
         guild: discord.Guild,
@@ -535,36 +712,7 @@ class MatchBot(commands.Bot):
             if not isinstance(channel, discord.TextChannel):
                 return
 
-        embed = self._build_queue_status_embed()
-        view = QueueControlView(self)
-
-        if setup.status_message_id is not None:
-            try:
-                message = await channel.fetch_message(setup.status_message_id)
-                await message.edit(embed=embed, view=view)
-                await self._ensure_queue_reactions(message)
-                return
-            except discord.NotFound:
-                pass
-
-        message = await channel.send(embed=embed, view=view)
-        await self._ensure_queue_reactions(message)
-        setup = GuildSetup(
-            guild_id=setup.guild_id,
-            category_id=setup.category_id,
-            status_channel_id=setup.status_channel_id,
-            status_message_id=message.id,
-            results_channel_id=setup.results_channel_id,
-            elo_channel_id=setup.elo_channel_id,
-            elo_message_id=setup.elo_message_id,
-            voice_channels=setup.voice_channels,
-            end_queue_channel_id=setup.end_queue_channel_id,
-            commands_channel_id=setup.commands_channel_id,
-            commands_player_message_id=setup.commands_player_message_id,
-            commands_admin_message_id=setup.commands_admin_message_id,
-        )
-        self.guild_setups[guild.id] = setup
-        await self.storage.save_guild_setup(setup)
+        await self._upsert_queue_status_message(guild, setup, channel)
 
     async def ensure_commands_panel(
         self,
@@ -874,20 +1022,8 @@ class MatchBot(commands.Bot):
             if not isinstance(channel, discord.TextChannel):
                 return
 
-        embed = self._build_queue_status_embed()
-        view = QueueControlView(self)
-
-        if setup.status_message_id is None:
-            await self.ensure_status_message(guild, setup)
-            await self._update_queue_ready_timers(guild)
-            return
-
-        try:
-            message = await channel.fetch_message(setup.status_message_id)
-            await message.edit(embed=embed, view=view)
-            await self._ensure_queue_reactions(message)
-        except discord.NotFound:
-            await self.ensure_status_message(guild, setup)
+        setup = self.guild_setups.get(guild.id, setup)
+        await self._upsert_queue_status_message(guild, setup, channel)
 
         await self._update_queue_ready_timers(guild)
         await self._ensure_queue_status_refresh(guild)
@@ -1017,22 +1153,39 @@ class MatchBot(commands.Bot):
                         except discord.HTTPException:
                             pass
 
-            status_channel = guild.get_channel(setup.status_channel_id)
-            if isinstance(status_channel, discord.TextChannel):
-                await self._send_transient(
-                    status_channel,
-                    f"**{mode.label}** queue on `{map_name}` was cancelled — {reason}",
-                )
-
         await self.refresh_queue_status(guild, sync_voice=False)
 
+    async def _sync_lobby_reactions(
+        self,
+        message: discord.Message,
+        *,
+        matchmaker: Matchmaker | None = None,
+        default_map: str | None = None,
+    ) -> None:
+        default_map = default_map or self.settings.default_map
+        matchmaker = matchmaker or self.matchmaker
+        plan = build_lobby_reaction_plan(matchmaker, default_map)
+        allowed = plan.emojis
+
+        for reaction in list(message.reactions):
+            emoji_str = str(reaction.emoji)
+            if emoji_str in allowed:
+                continue
+            try:
+                await message.clear_reaction(reaction.emoji)
+            except discord.HTTPException:
+                logger.debug("Could not clear stale reaction %s", emoji_str)
+
+        for emoji in allowed:
+            if any(str(reaction.emoji) == emoji for reaction in message.reactions):
+                continue
+            try:
+                await message.add_reaction(emoji)
+            except discord.HTTPException:
+                logger.exception("Failed to add %s reaction to queue status message", emoji)
+
     async def _ensure_queue_reactions(self, message: discord.Message) -> None:
-        for emoji in (READY_EMOJI, UNREADY_EMOJI):
-            if not any(str(reaction.emoji) == emoji for reaction in message.reactions):
-                try:
-                    await message.add_reaction(emoji)
-                except discord.HTTPException:
-                    logger.exception("Failed to add %s reaction to queue status message", emoji)
+        await self._sync_lobby_reactions(message)
 
     async def _resolve_reaction_member(
         self,
@@ -1107,6 +1260,125 @@ class MatchBot(commands.Bot):
 
         await self._sync_ready_reactions(message, member, ready)
 
+    async def _remove_member_reactions(
+        self,
+        message: discord.Message,
+        member: discord.Member,
+        emojis: frozenset[str],
+    ) -> None:
+        self._reaction_sync_user_ids.add(member.id)
+        try:
+            for emoji in emojis:
+                try:
+                    await message.remove_reaction(emoji, member)
+                except discord.HTTPException:
+                    pass
+        finally:
+            self._reaction_sync_user_ids.discard(member.id)
+
+    async def _process_lobby_reaction(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        message: discord.Message,
+        emoji: str,
+    ) -> None:
+        action = resolve_lobby_reaction(emoji, self.matchmaker, self.settings.default_map)
+        if action is None:
+            return
+
+        try:
+            if action.kind == LobbyReactionKind.CAPTAIN_ALPHA:
+                assert action.target_id is not None
+                await self._remove_member_reactions(message, member, alpha_vote_emojis() - {emoji})
+                mode, map_name, notice, match = self.matchmaker.cast_captain_vote(
+                    member.id,
+                    CaptainTeam.ALPHA,
+                    action.target_id,
+                )
+            elif action.kind == LobbyReactionKind.CAPTAIN_BRAVO:
+                assert action.target_id is not None
+                await self._remove_member_reactions(message, member, bravo_vote_emojis() - {emoji})
+                mode, map_name, notice, match = self.matchmaker.cast_captain_vote(
+                    member.id,
+                    CaptainTeam.BRAVO,
+                    action.target_id,
+                )
+            elif action.kind == LobbyReactionKind.DRAFT_PICK:
+                assert action.target_id is not None
+                mode, map_name, notice, match = self.matchmaker.draft_pick(
+                    member.id,
+                    action.target_id,
+                )
+            elif action.kind == LobbyReactionKind.MAP_BAN:
+                assert action.banned_map_id is not None
+                mode, map_name, notice, match = self.matchmaker.cast_premier_ban(
+                    member.id,
+                    action.banned_map_id,
+                )
+            elif action.kind == LobbyReactionKind.SIDE_CT:
+                mode, map_name, notice, match = self.matchmaker.cast_premier_side(
+                    member.id,
+                    "ct",
+                )
+            elif action.kind == LobbyReactionKind.SIDE_T:
+                mode, map_name, notice, match = self.matchmaker.cast_premier_side(
+                    member.id,
+                    "t",
+                )
+            else:
+                return
+        except ValueError as exc:
+            try:
+                await message.remove_reaction(emoji, member)
+            except discord.HTTPException:
+                pass
+            await self._notify_player(member, str(exc))
+            return
+
+        await self.refresh_queue_status(guild, sync_voice=False)
+        if match is not None:
+            await self.announce_match(guild, match)
+        elif notice:
+            await self._notify_player(member, notice)
+
+    async def _handle_lobby_reaction_add(
+        self,
+        payload: discord.RawReactionActionEvent,
+        emoji: str,
+    ) -> None:
+        if payload.user_id == self.user.id:
+            return
+        if payload.user_id in self._reaction_sync_user_ids:
+            return
+
+        guild = self.get_guild(payload.guild_id)
+        if guild is None:
+            return
+
+        setup = await self._get_guild_setup(guild)
+        if setup is None or payload.message_id != setup.status_message_id:
+            return
+
+        plan = build_lobby_reaction_plan(self.matchmaker, self.settings.default_map)
+        if emoji not in plan.actions:
+            return
+
+        member = await self._resolve_reaction_member(guild, payload.user_id)
+        if member is None:
+            return
+
+        channel = guild.get_channel(payload.channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return
+
+        try:
+            message = await channel.fetch_message(payload.message_id)
+        except discord.HTTPException:
+            return
+
+        await self._process_lobby_reaction(guild, member, message, emoji)
+
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         emoji = str(payload.emoji)
         if emoji == READY_EMOJI:
@@ -1115,6 +1387,19 @@ class MatchBot(commands.Bot):
         if emoji == UNREADY_EMOJI:
             await self._handle_queue_ready_reaction(payload, ready=False)
             return
+
+        guild = self.get_guild(payload.guild_id)
+        if guild is not None:
+            setup = await self._get_guild_setup(guild)
+            if setup is not None and payload.message_id == setup.status_message_id:
+                plan = build_lobby_reaction_plan(
+                    self.matchmaker,
+                    self.settings.default_map,
+                )
+                if emoji in plan.actions:
+                    await self._handle_lobby_reaction_add(payload, emoji)
+                    return
+
         await self._handle_command_panel_reaction(payload, emoji)
 
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:
@@ -1448,15 +1733,7 @@ class MatchBot(commands.Bot):
                 self.settings.default_map,
             )
 
-        setup = await self._get_guild_setup(guild)
-        if setup is not None:
-            status_channel = guild.get_channel(setup.status_channel_id)
-            if isinstance(status_channel, discord.TextChannel):
-                await self._send_transient(
-                    status_channel,
-                    f"{member.mention} reset **{selected_mode.label}** lobby via "
-                    f"**#{COMMANDS_CHANNEL_NAME}** panel.",
-                )
+        await self.refresh_queue_status(guild)
 
         return f"**{selected_mode.label}** lobby reset. {message}"
 
@@ -1604,12 +1881,7 @@ class MatchBot(commands.Bot):
         try:
             await member.send(message)
         except discord.HTTPException:
-            setup = self.guild_setups.get(member.guild.id)
-            if setup is None:
-                return
-            channel = member.guild.get_channel(setup.status_channel_id)
-            if isinstance(channel, discord.TextChannel):
-                await self._send_transient(channel, f"{member.mention} {message}")
+            logger.debug("Could not DM user %s: %s", member.id, message)
 
     async def _get_match_voice_ids(self, match_id: str) -> tuple[int, int] | None:
         cached = self._match_voice_channels.get(match_id)
@@ -1625,22 +1897,34 @@ class MatchBot(commands.Bot):
         match: ActiveMatch,
         team1_voice_id: int | None = None,
         team2_voice_id: int | None = None,
+        *,
+        for_discord_id: int | None = None,
     ) -> discord.Embed:
         public_host = self.connect_resolver.get_connect_host()
         public_port = self.connect_resolver.get_connect_port()
         server_password = self.connect_resolver.get_connect_password()
         connect_ready = self.connect_resolver.is_connect_ready()
+        join_url: str | None = None
+        if connect_ready:
+            join_url = resolve_join_url(
+                public_host,
+                public_port,
+                server_password,
+                public_url=self.settings.public_url,
+            )
 
         description_lines = [
             "Roster players are moved once into their side's **CT** or **T** voice channel. "
             "After that, roster and other members can join any voice channel in the server, "
             "including the match **CT** / **T** channels. "
             "Only **roster players** in this match can connect to the CS2 server. "
-            "MatchZy assigns your in-game team from your linked Steam ID.",
+            "MatchZy puts you on **CT** or **T** automatically when you connect — "
+            "use the same Steam account linked in Discord, then type `.ready` in game.",
         ]
-        if connect_ready:
+        if connect_ready and join_url:
+            description_lines.append(f"# [Launch CS2 and connect]({join_url})")
             description_lines.append(
-                "✅ **Server is online** — connect below, then type `.ready` in game chat."
+                "✅ **Server is online** — click the link above, then type `.ready` in game chat."
             )
         else:
             description_lines.append(
@@ -1654,6 +1938,17 @@ class MatchBot(commands.Bot):
             description="\n".join(description_lines),
             color=discord.Color.green(),
         )
+        if for_discord_id is not None:
+            assignment = player_assignment_label(match, for_discord_id)
+            if assignment is not None:
+                embed.add_field(
+                    name="Your assignment",
+                    value=(
+                        f"{assignment}\n"
+                        "_You should spawn on this side when you connect — no team pick needed._"
+                    ),
+                    inline=False,
+                )
         alpha_side = match.team1_side
         alpha_label = "CT" if alpha_side == "ct" else "T"
         bravo_label = "T" if alpha_side == "ct" else "CT"
@@ -1672,6 +1967,7 @@ class MatchBot(commands.Bot):
                     server_password or None,
                     public_url=self.settings.public_url,
                     alternate_host=self.connect_resolver.get_connect_alternate_host(),
+                    match=match,
                 ),
                 inline=False,
             )
@@ -1684,14 +1980,20 @@ class MatchBot(commands.Bot):
         embed.add_field(
             name="Teams",
             value=(
-                f"{format_team(match.team1, 'Team Alpha')}\n\n"
-                f"{format_team(match.team2, 'Team Bravo')}"
+                f"{format_match_team_roster(match, match.team1, 'Team Alpha', on_team1=True, join_url=join_url)}\n\n"
+                f"{format_match_team_roster(match, match.team2, 'Team Bravo', on_team1=False, join_url=join_url)}"
             ),
             inline=False,
         )
         return embed
 
-    def _server_connect_field(self) -> str:
+    def _primary_active_match(self) -> ActiveMatch | None:
+        matches = list(self.matchmaker.active_matches.values())
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def _server_connect_field(self, match: ActiveMatch | None = None) -> str:
         public_host = self.connect_resolver.get_connect_host()
         public_port = self.connect_resolver.get_connect_port()
         server_password = self.connect_resolver.get_connect_password()
@@ -1701,6 +2003,7 @@ class MatchBot(commands.Bot):
             server_password or None,
             public_url=self.settings.public_url,
             alternate_host=self.connect_resolver.get_connect_alternate_host(),
+            match=match or self._primary_active_match(),
         )
 
     def _queue_should_show_server_connect(self, default_map: str) -> bool:
@@ -1722,6 +2025,8 @@ class MatchBot(commands.Bot):
 
     async def _lock_idle_server(self) -> None:
         try:
+            if self.settings.server_provider == ServerProvider.DATHOST:
+                await self._ensure_dathost_server_ready(context="idle-lock")
             responses = await self.matchzy.lock_server_when_idle()
             logger.info(
                 "Idle server lock applied (%s)",
@@ -1737,30 +2042,80 @@ class MatchBot(commands.Bot):
 
     def _active_match_details_lines(self) -> list[str]:
         lines: list[str] = []
+        connect_ready = self.connect_resolver.is_connect_ready()
         for match in self.matchmaker.active_matches.values():
-            line = f"**{match.mode.label}** on `{match.map_name}` — Match ID `{match.match_id}`"
+            join_url: str | None = None
+            block_lines = [
+                f"**{match.mode.label}** on `{match.map_name}` · ID `{match.match_id}`",
+            ]
+            alpha_side = match.team1_side
+            alpha_label = "CT" if alpha_side == "ct" else "T"
+            bravo_label = "T" if alpha_side == "ct" else "CT"
+            block_lines.append(
+                f"Team Alpha **{alpha_label}** · Team Bravo **{bravo_label}**"
+            )
+            if connect_ready:
+                join_url = resolve_join_url(
+                    self.connect_resolver.get_connect_host(),
+                    self.connect_resolver.get_connect_port(),
+                    self.connect_resolver.get_connect_password(),
+                    public_url=self.settings.public_url,
+                )
+                block_lines.append(f"# [Launch CS2 and connect]({join_url})")
+                block_lines.append(
+                    "✅ **Server online** — click the link above or use **Join game server** below, "
+                    "then type `.ready` in game."
+                )
+            else:
+                block_lines.append(
+                    "⏳ **Map loading** — connect info appears here when the server is ready."
+                )
+
             snapshot = self._live_match_snapshots.get(match.match_id)
             if snapshot is not None:
                 if snapshot.status == "Live":
-                    line += " · 🔴 **LIVE**"
+                    block_lines.append("🔴 **LIVE**")
                 elif snapshot.status == "Finished":
-                    line += " · ✅ **Finished**"
+                    block_lines.append("✅ **Finished**")
                 if (
                     snapshot.team1_round_score is not None
                     and snapshot.team2_round_score is not None
                 ):
-                    line += (
-                        f" · Score **{snapshot.team1_round_score}**"
-                        f" — **{snapshot.team2_round_score}**"
+                    block_lines.append(
+                        f"Score **{snapshot.team1_round_score}** — **{snapshot.team2_round_score}**"
                     )
                 if snapshot.round_number is not None:
-                    line += f" · Round **{snapshot.round_number + 1}**"
+                    block_lines.append(f"Round **{snapshot.round_number + 1}**")
+
+            voice_ids = self._match_voice_channels.get(match.match_id)
+            if voice_ids is not None:
+                block_lines.append(f"Voice: CT <#{voice_ids[0]}> · T <#{voice_ids[1]}>")
+
+            block_lines.append(
+                format_match_team_roster(
+                    match,
+                    match.team1,
+                    "Team Alpha",
+                    on_team1=True,
+                    join_url=join_url,
+                )
+            )
+            block_lines.append(
+                format_match_team_roster(
+                    match,
+                    match.team2,
+                    "Team Bravo",
+                    on_team1=False,
+                    join_url=join_url,
+                )
+            )
+
             if self.settings.server_provider == ServerProvider.DATHOST:
-                line += (
-                    f"\n_If the match does not end automatically, use **Report** "
+                block_lines.append(
+                    f"_If the match does not end automatically, use **Report** "
                     f"buttons in #{RESULTS_CHANNEL_NAME}._"
                 )
-            lines.append(line)
+            lines.append("\n".join(block_lines))
         return lines
 
     async def _setup_match_voice_channels(
@@ -2133,25 +2488,7 @@ class MatchBot(commands.Bot):
 
         if cancelled:
             await self._finalize_cancelled_live_match(guild, match_id)
-        await self._clear_match_status_message(guild, match_id)
         self._live_match_snapshots.pop(match_id, None)
-
-        setup = await self._get_guild_setup(guild)
-        if setup is not None:
-            channel = guild.get_channel(setup.status_channel_id)
-            if isinstance(channel, discord.TextChannel):
-                end_queue = guild.get_channel(setup.end_queue_channel_id)
-                end_queue_mention = (
-                    f" Players moved to {end_queue.mention}."
-                    if isinstance(end_queue, discord.VoiceChannel)
-                    else " Players moved to **End Queue**."
-                )
-                end_note = (
-                    f"cancelled (no ELO).{end_queue_mention}"
-                    if cancelled
-                    else f"ended.{end_queue_mention}"
-                )
-                await self._send_status_notice(guild, f"Match `{match_id}` {end_note}")
 
         await self.refresh_queue_status(guild)
 
@@ -2188,21 +2525,6 @@ class MatchBot(commands.Bot):
             view=view,
             delete_after=float(self.settings.transient_message_seconds),
         )
-
-    async def _send_status_notice(
-        self,
-        guild: discord.Guild,
-        content: str | None = None,
-        *,
-        embed: discord.Embed | None = None,
-    ) -> discord.Message | None:
-        setup = await self._get_guild_setup(guild)
-        if setup is None:
-            return None
-        channel = guild.get_channel(setup.status_channel_id)
-        if not isinstance(channel, discord.TextChannel):
-            return None
-        return await self._send_transient(channel, content, embed=embed)
 
     async def _protected_panel_and_live_ids(self, guild: discord.Guild) -> set[int]:
         protected: set[int] = set()
@@ -2519,16 +2841,14 @@ class MatchBot(commands.Bot):
 
         team1_voice_id, team2_voice_id = team_voice_ids
 
-        embed = self._build_match_embed(match, team1_voice_id, team2_voice_id)
-        setup = self.guild_setups.get(guild.id)
-        if setup is not None:
-            channel = guild.get_channel(setup.status_channel_id)
-            if isinstance(channel, discord.TextChannel):
-                message = await self._send_transient(channel, embed=embed)
-                self._match_status_messages[match.match_id] = message.id
-
         for player in match.team1 + match.team2:
             user = self.get_user(player.discord_id) or await self.fetch_user(player.discord_id)
+            embed = self._build_match_embed(
+                match,
+                team1_voice_id,
+                team2_voice_id,
+                for_discord_id=player.discord_id,
+            )
             try:
                 await user.send(embed=embed)
             except discord.HTTPException:
@@ -2587,18 +2907,6 @@ class MatchBot(commands.Bot):
         team1_voice_id: int | None,
         team2_voice_id: int | None,
     ) -> None:
-        embed = self._build_match_embed(match, team1_voice_id, team2_voice_id)
-        setup = self.guild_setups.get(guild.id)
-        if setup is not None:
-            channel = guild.get_channel(setup.status_channel_id)
-            message_id = self._match_status_messages.get(match.match_id)
-            if isinstance(channel, discord.TextChannel) and message_id is not None:
-                try:
-                    message = await channel.fetch_message(message_id)
-                    await message.edit(embed=embed)
-                except (discord.NotFound, discord.HTTPException):
-                    pass
-
         snapshot = self._live_match_snapshots.get(match.match_id)
         if snapshot is not None:
             snapshot.status = "Server online — connect and type .ready"
@@ -2627,27 +2935,6 @@ class MatchBot(commands.Bot):
 
         await self.refresh_queue_status(guild)
 
-    async def _clear_match_status_message(self, guild: discord.Guild, match_id: str) -> None:
-        message_id = self._match_status_messages.pop(match_id, None)
-        if message_id is None:
-            return
-
-        setup = await self._get_guild_setup(guild)
-        if setup is None:
-            return
-
-        channel = guild.get_channel(setup.status_channel_id)
-        if not isinstance(channel, discord.TextChannel):
-            return
-
-        try:
-            message = await channel.fetch_message(message_id)
-            await message.delete()
-        except discord.NotFound:
-            pass
-        except discord.HTTPException:
-            logger.warning("Could not delete match status message %s", message_id)
-
     async def _rollback_failed_match(
         self,
         guild: discord.Guild,
@@ -2660,17 +2947,6 @@ class MatchBot(commands.Bot):
         await self.storage.update_match_status(match.match_id, "cancelled")
 
         await self._lock_idle_server()
-
-        setup = await self._get_guild_setup(guild)
-        if setup is not None:
-            channel = guild.get_channel(setup.status_channel_id)
-            if isinstance(channel, discord.TextChannel):
-                await self._send_transient(
-                    channel,
-                    f"Match `{match.match_id}` could not start: `{error}`\n"
-                    "Players were returned to the queue. An admin can react 🛑 on "
-                    f"**#{COMMANDS_CHANNEL_NAME}** if the server still has a match loaded.",
-                )
 
         await self.refresh_queue_status(guild)
 
@@ -2698,7 +2974,7 @@ class MatchBot(commands.Bot):
             if mode is not None:
                 self.matchmaker.enter_queue(mode, member.id, discord_name, steam_id)
 
-        _, map_name, match, voting_started = self.matchmaker.set_ready(member.id, ready)
+        _, map_name, match, _ = self.matchmaker.set_ready(member.id, ready)
         await self.refresh_queue_status(guild)
 
         entry_data = self.matchmaker.get_entry(member.id)
@@ -2716,7 +2992,7 @@ class MatchBot(commands.Bot):
             ):
                 message = (
                     f"You are **ready** for `{map_name}`. "
-                    "Captain voting is open — click **Vote Captains** in #queue-status."
+                    "Captain voting is open — react **1️⃣–🔟** (Alpha) and **Ⓐ–Ⓙ** (Bravo) on this message."
                 )
             elif (
                 self.matchmaker.captains_required(mode)
@@ -2724,17 +3000,17 @@ class MatchBot(commands.Bot):
             ):
                 message = (
                     f"You are **ready** for `{map_name}`. "
-                    "Player draft in progress — captains use **Pick Player** when it is their turn."
+                    "Player draft in progress — react **1️⃣–🔟** on this message when it is your turn to pick."
                 )
             elif veto_flow.phase == PremierVetoPhase.BANNING:
                 message = (
                     f"You are **ready** for **{mode.label}**. "
-                    "Premier map veto is open — captains use **Ban Map** in #queue-status."
+                    "Premier map veto is open — react the map's fixed number on this message."
                 )
             elif veto_flow.phase == PremierVetoPhase.SIDE_PICK:
                 message = (
                     f"You are **ready** for **{mode.label}**. "
-                    "Side pick is open — the designated captain uses **Pick Side** (CT/T)."
+                    "Side pick is open — react **🛡️** (CT) or **⚔️** (T) on this message."
                 )
             elif (
                 self.matchmaker.captains_required(mode)
@@ -2753,24 +3029,6 @@ class MatchBot(commands.Bot):
                 message = f"You are **ready** for `{map_name}`. Waiting for other players..."
         else:
             message = "You are **not ready**."
-
-        if voting_started:
-            setup = await self._get_guild_setup(guild)
-            if setup is not None:
-                channel = guild.get_channel(setup.status_channel_id)
-                if isinstance(channel, discord.TextChannel):
-                    if self.matchmaker.captains_required(mode):
-                        await self._send_transient(
-                            channel,
-                            f"**{mode.label}** on `{map_name}` has enough ready players. "
-                            "Lobby players should click **Vote Captains** in this channel.",
-                        )
-                    elif mode == MatchMode.ONE_V_ONE:
-                        await self._send_transient(
-                            channel,
-                            f"**{mode.label}** has enough ready players. "
-                            "Captains alternate **Ban Map**, then **Pick Side** (CT/T).",
-                        )
 
         if match is not None:
             await self.announce_match(guild, match)
@@ -2803,94 +3061,6 @@ class MatchBot(commands.Bot):
         if queued is None:
             raise ValueError("Join a **Queue » 1v1 / 2v2 / 5v5** voice channel first.")
         return queued
-
-    async def _notify_premier_veto_started(
-        self,
-        guild: discord.Guild,
-        mode: MatchMode,
-        map_name: str,
-        *,
-        prefix: str = "Draft complete",
-    ) -> None:
-        veto_flow = self.matchmaker.get_premier_veto_flow(mode, map_name)
-        if veto_flow.phase != PremierVetoPhase.BANNING:
-            return
-
-        setup = await self._get_guild_setup(guild)
-        if setup is None:
-            return
-
-        channel = guild.get_channel(setup.status_channel_id)
-        if not isinstance(channel, discord.TextChannel):
-            return
-
-        captain_id = veto_flow.captain_for_team(veto_flow.ban_turn_team())
-        captain_text = f"<@{captain_id}>" if captain_id is not None else "The captain"
-        await self._send_transient(
-            channel,
-            f"{prefix} for **{mode.label}** — Premier map veto started. "
-            f"{captain_text} ({veto_flow.team_label(veto_flow.ban_turn_team())}), "
-            "click **Ban Map**.",
-        )
-
-    async def handle_open_premier_ban(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None:
-            await interaction.response.send_message(
-                "This button only works inside a server.",
-                ephemeral=True,
-            )
-            return
-
-        member = interaction.user
-        if not isinstance(member, discord.Member):
-            await interaction.response.send_message(
-                "Could not resolve your member profile.",
-                ephemeral=True,
-            )
-            return
-
-        try:
-            mode, map_name = await self._prepare_queue_member(member, interaction.guild)
-        except ValueError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
-            return
-
-        flow = self.matchmaker.get_premier_veto_flow(mode, map_name)
-        if flow.phase == PremierVetoPhase.NONE and mode == MatchMode.ONE_V_ONE:
-            self.matchmaker.maybe_start_premier_veto_1v1(mode, map_name)
-        if flow.phase != PremierVetoPhase.BANNING:
-            await interaction.response.send_message(
-                "Premier map veto is not active for your queue right now.",
-                ephemeral=True,
-            )
-            return
-        if not flow.in_lobby(member.id):
-            await interaction.response.send_message(
-                "You are not in the active match lobby for this queue.",
-                ephemeral=True,
-            )
-            return
-        if member.id != flow.captain_for_team(flow.ban_turn_team()):
-            await interaction.response.send_message(
-                f"Only **{flow.team_label(flow.ban_turn_team())}** captain can ban right now.",
-                ephemeral=True,
-            )
-            return
-
-        remaining_maps = sorted(flow.remaining_maps)
-        if not remaining_maps:
-            await interaction.response.send_message(
-                "No maps left to ban.",
-                ephemeral=True,
-            )
-            return
-
-        view = PremierBanSelectView(self, mode, map_name, remaining_maps)
-        await interaction.response.send_message(
-            f"**{flow.team_label(flow.ban_turn_team())}** — ban one map from the Active Duty pool.",
-            view=view,
-            ephemeral=True,
-        )
 
     async def handle_open_side_pick(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -2933,7 +3103,6 @@ class MatchBot(commands.Bot):
                 f"Only the **{picker}** captain can pick CT or T right now.",
                 ephemeral=True,
             )
-            return
 
         view = SidePickView(self, mode, map_name)
         await interaction.response.send_message(
@@ -2963,7 +3132,7 @@ class MatchBot(commands.Bot):
             await interaction.followup.send(str(exc), ephemeral=True)
             return
 
-        await self.refresh_queue_status(interaction.guild)
+        await self.refresh_queue_status(interaction.guild, sync_voice=False)
         await interaction.followup.send(message, ephemeral=True)
 
         if match is not None:
@@ -2990,22 +3159,10 @@ class MatchBot(commands.Bot):
             await interaction.followup.send(str(exc), ephemeral=True)
             return
 
-        await self.refresh_queue_status(interaction.guild)
+        await self.refresh_queue_status(interaction.guild, sync_voice=False)
         await interaction.followup.send(message, ephemeral=True)
 
         if match is not None:
-            setup = await self._get_guild_setup(interaction.guild)
-            if setup is not None:
-                channel = interaction.guild.get_channel(setup.status_channel_id)
-                if isinstance(channel, discord.TextChannel):
-                    alpha_side = match.team1_side
-                    alpha_label = "CT" if alpha_side == "ct" else "T"
-                    bravo_label = "T" if alpha_side == "ct" else "CT"
-                    await self._send_transient(
-                        channel,
-                        f"Premier veto complete for **{mode.label}** — `{match.map_name}` · "
-                        f"Team Alpha **{alpha_label}**, Team Bravo **{bravo_label}**.",
-                    )
             await self.announce_match(interaction.guild, match)
 
     async def handle_open_captain_vote(self, interaction: discord.Interaction) -> None:
@@ -3082,33 +3239,11 @@ class MatchBot(commands.Bot):
             await interaction.followup.send(str(exc), ephemeral=True)
             return
 
-        await self.refresh_queue_status(interaction.guild)
+        await self.refresh_queue_status(interaction.guild, sync_voice=False)
         await interaction.followup.send(message, ephemeral=True)
 
         if match is not None:
             await self.announce_match(interaction.guild, match)
-            return
-
-        await self._notify_premier_veto_started(interaction.guild, mode, map_name)
-        if (
-            self.matchmaker.get_premier_veto_flow(mode, map_name).phase
-            == PremierVetoPhase.BANNING
-        ):
-            return
-
-        flow = self.matchmaker.get_captain_flow(mode, map_name)
-        if flow.phase == CaptainPhase.DRAFTING:
-            setup = await self._get_guild_setup(interaction.guild)
-            if setup is not None:
-                channel = interaction.guild.get_channel(setup.status_channel_id)
-                if isinstance(channel, discord.TextChannel):
-                    picker = flow.current_picker_id()
-                    picker_text = f"<@{picker}>" if picker is not None else "the captain"
-                    await self._send_transient(
-                        channel,
-                        f"Captain voting finished for **{mode.label}** on `{map_name}`. "
-                        f"{picker_text}, click **Pick Player** to draft your team.",
-                    )
 
     async def handle_open_draft_pick(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -3183,33 +3318,11 @@ class MatchBot(commands.Bot):
             await interaction.followup.send(str(exc), ephemeral=True)
             return
 
-        await self.refresh_queue_status(interaction.guild)
+        await self.refresh_queue_status(interaction.guild, sync_voice=False)
         await interaction.followup.send(message, ephemeral=True)
 
         if match is not None:
             await self.announce_match(interaction.guild, match)
-            return
-
-        await self._notify_premier_veto_started(interaction.guild, mode, map_name)
-        if (
-            self.matchmaker.get_premier_veto_flow(mode, map_name).phase
-            == PremierVetoPhase.BANNING
-        ):
-            return
-
-        flow = self.matchmaker.get_captain_flow(mode, map_name)
-        if flow.phase == CaptainPhase.DRAFTING:
-            setup = await self._get_guild_setup(interaction.guild)
-            if setup is not None:
-                channel = interaction.guild.get_channel(setup.status_channel_id)
-                if isinstance(channel, discord.TextChannel):
-                    picker = flow.current_picker_id()
-                    picker_text = f"<@{picker}>" if picker is not None else "the next captain"
-                    next_team = "Team Alpha" if flow.pick_turn == CaptainTeam.ALPHA else "Team Bravo"
-                    await self._send_transient(
-                        channel,
-                        f"**{next_team}** is up next — {picker_text}, click **Pick Player**.",
-                    )
 
     async def _finish_match_from_event(
         self,

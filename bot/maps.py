@@ -89,9 +89,11 @@ MAP_IDS: frozenset[str] = frozenset(MAP_BY_ID)
 ACTIVE_DUTY_MAPS: list[Cs2Map] = [
     game_map for game_map in CS2_MAPS if game_map.pool == "Active Duty"
 ]
-PREMIER_VETO_POOL: frozenset[str] = frozenset(
+# Stable veto order — map ban reactions always map to the same map id.
+PREMIER_VETO_MAP_ORDER: tuple[str, ...] = tuple(
     game_map.map_id for game_map in ACTIVE_DUTY_MAPS
-)
+) + ("de_train", "de_cache")
+PREMIER_VETO_POOL: frozenset[str] = frozenset(PREMIER_VETO_MAP_ORDER)
 
 
 def is_valid_map(map_id: str) -> bool:

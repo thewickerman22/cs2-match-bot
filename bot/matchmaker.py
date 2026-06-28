@@ -213,7 +213,7 @@ class Matchmaker:
             message = (
                 f"Banned **{banned_name}**.\n"
                 f"Map veto complete — playing **{chosen_name}** (`{flow.chosen_map}`).\n"
-                f"**{picker_label}** captain: pick **CT** or **T** with **Pick Side**."
+                f"**{picker_label}** captain: react **🛡️ CT** or **⚔️ T** on the queue-status message."
             )
             return mode, map_name, message, None
 
@@ -391,7 +391,7 @@ class Matchmaker:
         flow.start_draft(mode)
         message = (
             f"Captain process restarted. <@{discord_id}> is **{team_label}** captain. "
-            "Captains pick players in turn via **Pick Player** in #queue-status."
+            "Captains pick players in turn by reacting on the queue-status message."
         )
         match = self.try_complete_draft(mode, selected_map)
         if match is not None:

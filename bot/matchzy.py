@@ -176,6 +176,23 @@ class MatchZyService:
 
         self.console = console
 
+    async def _run_console_sequence(
+        self,
+        commands: tuple[str, ...],
+        *,
+        delay_seconds: float = 0.75,
+        failure_label: str = "MatchZy console command",
+    ) -> list[str]:
+        responses: list[str] = []
+        for command in commands:
+            try:
+                responses.append(await self.console.execute(command))
+            except Exception:
+                logger.warning("%s failed: %s", failure_label, command)
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+        return responses
+
 
 
     def build_match_json_url(self, match_id: str) -> str:
@@ -269,28 +286,26 @@ class MatchZyService:
         return responses
 
     async def unlock_server_for_active_match(self) -> list[str]:
-        """Allow roster players to connect while a match JSON is loaded."""
-        responses: list[str] = []
-        for command in ("matchzy_kick_when_no_match_loaded 0",):
-            try:
-                responses.append(await self.console.execute(command))
-            except Exception:
-                logger.debug("Could not send MatchZy command: %s", command)
-        return responses
+        """Allow joins while a match JSON is loaded."""
+        return await self._run_console_sequence(
+            ("matchzy_kick_when_no_match_loaded 0",),
+            failure_label="MatchZy unlock command",
+        )
 
     async def lock_server_when_idle(self) -> list[str]:
         """Kick everyone and block joins when no match is loaded."""
-        responses: list[str] = []
-        for command in (
-            "css_endmatch",
-            "css_forceend",
-            "matchzy_kick_when_no_match_loaded 1",
-        ):
-            try:
-                responses.append(await self.console.execute(command))
-            except Exception:
-                logger.debug("Could not send MatchZy idle-lock command: %s", command)
-        return responses
+        # Enable matchModeOnly before endmatch so MatchZy's ResetMatch UpdatePlayersMap
+        # sweep kicks connected players (teamPlayers are cleared on reset).
+        return await self._run_console_sequence(
+            (
+                "matchzy_kick_when_no_match_loaded 1",
+                "css_endmatch",
+                "css_forceend",
+                "css_exitprac",
+            ),
+            delay_seconds=1.0,
+            failure_label="MatchZy idle-lock command",
+        )
 
 
 
@@ -299,6 +314,8 @@ class MatchZyService:
         """Reset MatchZy, enter match mode, and load match JSON (triggers map change)."""
 
         responses: list[str] = []
+
+        responses.extend(await self.unlock_server_for_active_match())
 
         responses.extend(await self.reset_match_state())
 
