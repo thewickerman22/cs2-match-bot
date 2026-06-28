@@ -2,7 +2,7 @@
 
 Discord bot for organizing **1v1**, **2v2 Wingman**, and **5v5** Counter-Strike 2 matches. The bot queues players on Discord, runs captain draft and Premier-style map veto, builds MatchZy match JSON, and loads it on a CS2 dedicated server.
 
-**No typed commands** — everything is buttons, reactions, and select menus.
+**No typed commands** — everything is reactions, buttons, and select menus. Lobby phases (captain vote, draft, map veto, side pick) run on reactions on the pinned **#queue-status** message.
 
 ## Architecture
 
@@ -20,10 +20,10 @@ flowchart LR
 
 1. Players link their Steam64 ID in Discord.
 2. The bot creates matchmaking channels under **CS2 Matchmaking** (voice queues, `#queue-status`, `#bot-commands`, `#match-results`, `#elo-leaderboard`, **End Queue**).
-3. Players join a queue voice channel and react **✅** on `#queue-status` when ready.
-4. When enough players are ready, the bot runs captain selection (2v2/5v5), Premier map veto, and side pick (CT/T).
+3. Players join a queue voice channel and react **✅** / **❌** on the pinned `#queue-status` message when ready.
+4. When enough players are ready, the bot updates the same pinned embed with **Lobby status** and syncs phase reactions: captain vote, player draft (2v2/5v5), Premier map veto, and side pick (CT/T).
 5. The bot generates MatchZy match JSON and loads it on the server.
-6. The bot waits for the game port to accept connections, then posts connect info (HTTPS join link + console command).
+6. The bot waits for the game port to accept connections, then posts connect info on the pinned embed (**Join game server** link + console command).
 7. Players connect to the CS2 server and type `.ready` in game chat (MatchZy warmup).
 8. MatchZy sends webhooks when the map/series ends — the bot posts results, updates ELO, and cleans up voice channels.
 
@@ -139,7 +139,7 @@ When `DISCORD_GUILD_ID` is set, the bot auto-creates channels on startup. To rec
 | Channel | Purpose |
 |---|---|
 | **Queue » 1v1 / 2v2 / 5v5** | Join to enter the queue for that mode |
-| **#queue-status** | Live queue embed, lobby buttons, ✅/❌ ready reactions |
+| **#queue-status** | Single pinned embed: queue counts, **Lobby status**, active match + **Join game server**, ✅/❌ ready, lobby reactions |
 | **#bot-commands** | Pinned player + admin control panels |
 | **#match-results** | Live match embed during play; final results after each match |
 | **#elo-leaderboard** | Pinned top-10 leaderboard (resets every 3 months) |
@@ -156,10 +156,10 @@ Use the pinned panel in **#bot-commands** (or duplicate buttons on **#queue-stat
 | **Link Steam Account** | `#bot-commands` or `#queue-status` | Opens a modal for your 17-digit Steam64 ID |
 | **Unlink Steam** | `#bot-commands` or `#queue-status` | Removes your Steam link |
 | **✅ / ❌** | `#queue-status` | Ready / unready |
-| **Vote Captains** | `#queue-status` | Vote for Team Alpha and Team Bravo captains (2v2/5v5) |
-| **Pick Player** | `#queue-status` | Captain draft pick |
-| **Ban Map** | `#queue-status` | Premier veto ban |
-| **Pick Side** | `#queue-status` | Choose CT or T after veto |
+| **1️⃣–🔟 / Ⓐ–Ⓙ** | `#queue-status` | Captain vote — number = Team Alpha pick, letter = Team Bravo pick (2v2/5v5) |
+| **1️⃣–🔟** | `#queue-status` | Captain draft pick — react the number next to an available player |
+| **1️⃣–7️⃣** | `#queue-status` | Premier map veto — ban the map with that number (captain only) |
+| **🛡️ / ⚔️** | `#queue-status` | Side pick — CT or T after veto (captain only) |
 | **Report: Team Alpha/Bravo Won** | `#match-results` | Majority roster vote if webhooks fail |
 | **End Match (No ELO)** | `#match-results` | Majority roster vote — cleanup only, no ELO |
 
@@ -189,18 +189,36 @@ Set `DISCORD_ADMIN_ROLE_ID` in `.env` to grant the admin role without Discord se
 | 2 | Join a **Queue » …** voice channel — you are added automatically and `#queue-status` updates |
 | 3 | React **✅** on `#queue-status` when ready, or **❌** / remove ✅ to unready |
 | 4 | Once the queue is **full**, everyone must ready within **5 minutes** (default) or the queue is cancelled |
-| 5 | For **2v2 / 5v5**, lobby players vote for captains via **Vote Captains** |
-| 6 | Captains alternate **Pick Player** until both teams are full |
-| 7 | **Premier map veto** — captains alternate **Ban Map** until one map remains |
-| 8 | The non-banning captain **Pick Side** (CT or T); the match deploys to the server |
+| 5 | For **2v2 / 5v5**, lobby players react **1️⃣–🔟** (Alpha captain) and **Ⓐ–Ⓙ** (Bravo captain) on the pinned message |
+| 6 | Captains alternate draft picks — react **1️⃣–🔟** next to the player you want |
+| 7 | **Premier map veto** — the banning captain reacts **1️⃣–7️⃣** on the listed map |
+| 8 | The side-picking captain reacts **🛡️** (CT) or **⚔️** (T); the match deploys to the server |
 
 Leave a queue voice channel to leave the queue.
 
-When a match starts, the bot creates temporary **CT** and **T** voice channels and moves players to their assigned side. The match embed includes a **Launch CS2 and Join** link (opens `/join` on your bot, then Steam) and a `connect host:port` console command.
+### Lobby status and reactions
 
-**Wait for “Server is online”** in Discord before connecting — MatchZy reloads the map when a match deploys and the UDP port is closed for 30–90 seconds.
+All lobby activity is shown on **one pinned message** in `#queue-status` — no separate channel posts for captain vote, draft, veto, or match status.
 
-When the match ends (MatchZy webhook, player report, or admin 🛑), players move to **End Queue**, team channels are deleted, and the result is posted to `#match-results`.
+The **Lobby status** field lists every player in queue (ready state, team, vote status). During an active lobby, per-mode fields point to that list instead of duplicating names.
+
+| Phase | Reactions on `#queue-status` |
+|---|---|
+| Ready | ✅ ready · ❌ unready |
+| Captain vote (2v2/5v5) | **1️⃣–🔟** = Alpha captain · **Ⓐ–Ⓙ** = Bravo captain |
+| Player draft | **1️⃣–🔟** = pick available player (captain only) |
+| Map veto | **1️⃣–7️⃣** = ban map (listed in Lobby status) |
+| Side pick | **🛡️** CT · **⚔️** T |
+
+On **5v5 captain vote**, Discord allows at most 20 reactions on one message, so ✅/❌ ready toggles are temporarily removed until voting finishes. Players are already ready when the lobby opens.
+
+When a match starts, the bot creates temporary **CT** and **T** voice channels and moves players to their assigned side. The pinned embed shows **Active match** and **Join game server** (HTTPS link via `/join`, plus a `connect host:port` console command).
+
+**Wait for “Server is online”** in `#queue-status` before connecting — MatchZy reloads the map when a match deploys and the UDP port is closed for 30–90 seconds.
+
+Only players on the **match roster** (locked in when the lobby completed) can stay on the CS2 server. Wrong or missing Steam links cause `KICKING PLAYER ... (NOT ALLOWED!)` — re-link the correct **steamID64** from [steamid.io](https://steamid.io).
+
+When the match ends (MatchZy webhook, player report, or admin 🛑), players move to **End Queue**, team channels are deleted, the server is locked until the next match, and the result is posted to `#match-results`.
 
 ## Supported maps
 
@@ -421,8 +439,9 @@ Run the CS2 server separately with Docker Compose, or point `CS2_HOST`/`CS2_PORT
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `KICKING PLAYER ... (NOT ALLOWED!)` | Steam64 not in match roster | Re-link correct **steamID64** from [steamid.io](https://steamid.io); only queued players can join |
-| Kicked when no match loaded | `matchzy_kick_when_no_match_loaded 1` | Set to `0` in DatHost `config.cfg`, reboot server |
+| `KICKING PLAYER ... (NOT ALLOWED!)` | Steam64 not in match roster | Re-link correct **steamID64** from [steamid.io](https://steamid.io); only players locked into the lobby roster can join |
+| Can connect but kicked immediately | Joined before match JSON loaded, or wrong Steam account | Wait for **Server is online**; verify Steam link matches the account you launch CS2 with |
+| Kicked when no match loaded | `matchzy_kick_when_no_match_loaded 1` or match ended | Set to `0` in DatHost `config.cfg`; between matches the bot locks the server until the next deploy |
 | `Unknown command 'matchzy_ffw_enabled'` | Older MatchZy build | Set ffw/gg in `config.cfg` only — harmless |
 
 ### Bot / Discord
@@ -431,6 +450,7 @@ Run the CS2 server separately with Docker Compose, or point `CS2_HOST`/`CS2_PORT
 - **DatHost commands not working**: Ensure MatchZy is installed and `DATHOST_*` credentials are correct.
 - **Voice queue not detected after restart**: Click **Refresh Setup** or restart the bot with `DISCORD_GUILD_ID` set.
 - **Ready reaction does nothing**: Join a queue voice channel first and link Steam.
+- **Lobby reaction does nothing**: Check **Lobby status** on `#queue-status` — only lobby players can vote; captains pick draft/veto/side; during 5v5 captain vote, use number/letter reactions (✅/❌ may be hidden until voting ends).
 - **Deploy import errors on server**: Sync the entire `bot/` folder before rebuilding — partial uploads cause crashes.
 - **Match ends in-game but voice channels stay / no ELO**: Webhooks not reaching the bot. Look for `POST /matchzy/events` and `series_end` in logs. Fix `matchzy_remote_log_url` on the CS2 server. **Workaround:** **Report** buttons on the live embed, or admin 🛑.
 - **Live score stuck on “Score pending”**: Same as above — `round_end` webhooks not arriving.
@@ -451,6 +471,7 @@ cs2-match-bot/
 │   ├── command_panel.py
 │   ├── guild_setup.py
 │   ├── queue_ui.py
+│   ├── lobby_reactions.py
 │   ├── steam_link_ui.py
 │   ├── match_finish_ui.py
 │   ├── message_lifecycle.py
